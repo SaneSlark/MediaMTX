@@ -4,13 +4,17 @@ logFile: /var/log/mediamtx.log
 
 api: yes
 apiAddress: :9997
+apiAllowOrigins: ['*']
 metrics: yes
 metricsAddress: :9998
+metricsAllowOrigins: ['*']
 pprof: yes
 pprofAddress: :9999
+pprofAllowOrigins: ['*']
 
 playback: yes
 playbackAddress: :9996
+playbackAllowOrigins: ['*']
 
 rtmp: yes
 rtmpAddress: :1935
@@ -21,6 +25,7 @@ rtspTransports: [tcp, udp]
 
 hls: yes
 hlsAddress: :8888
+hlsAllowOrigins: ['*']
 hlsSegmentDuration: 1s
 hlsPartDuration: 2s
 hlsSegmentCount: 10
@@ -28,6 +33,7 @@ hlsAlwaysRemux: yes
 
 webrtc: yes
 webrtcAddress: :8889
+webrtcAllowOrigins: ['*']
 webrtcLocalUDPAddress: :8189
 webrtcAdditionalHosts: [YOUR_PUBLIC_OR_LAN_IP]
 

@@ -17,7 +17,7 @@ const CONFIG = {
   CACHE_DIR: process.env.CACHE_DIR || path.join(__dirname, 'media_cache'),
   TEMP_DIR: process.env.TEMP_DIR || '/dev/shm',
   CACHE_TTL_MS: Number(process.env.CACHE_TTL_MS || 360 * 24 * 60 * 60 * 1000),
-  CLEAN_INTERVAL_MS: Number(process.env.CLEAN_INTERVAL_MS || 30 * 24 * 60 * 60 * 1000),
+  CLEAN_INTERVAL_MS: Number(process.env.CLEAN_INTERVAL_MS || 20 * 24 * 60 * 60 * 1000),
   FFMPEG_TIMEOUT_MS: Number(process.env.FFMPEG_TIMEOUT_MS || 60000),
   MAX_DURATION: Number(process.env.MAX_DURATION || 3600),
 };
