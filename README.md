@@ -49,6 +49,42 @@ Compose 默认使用本地目录：
 ./mediamtx.yml -> /config/mediamtx.yml
 ```
 
+## 录像回放列表
+
+MediaMTX 回放列表接口：
+
+```text
+http://服务器IP:9996/list?path=camera1
+```
+
+按时间范围查询：
+
+```text
+http://服务器IP:9996/list?path=camera1&start=2026-08-25T00%3A00%3A00Z&end=2026-08-25T23%3A59%3A59Z
+```
+
+`path` 对应 `mediamtx.yml` 里的摄像头路径，例如 `camera1`、`camera2`。
+
+## 回放代理
+
+代理接口会从 MediaMTX 取录像片段，并缓存为浏览器更容易播放的 MP4：
+
+```text
+http://服务器IP:9995/get?path=camera1&start=2026-08-25T10%3A00%3A00Z&duration=60
+```
+
+参数说明：
+
+- `path`：摄像头路径。
+- `start`：开始时间，使用 URL 编码后的 RFC3339 时间。
+- `duration`：回放时长，单位秒。
+
+健康检查：
+
+```text
+http://服务器IP:9995/health
+```
+
 ## 新增摄像头
 
 在 `mediamtx.yml` 的 `paths` 中增加原始路径和延迟发布路径即可。例如：
@@ -74,6 +110,14 @@ paths:
 rtsp://127.0.0.1:8554/camera5 -> rtsp://127.0.0.1:8554/camera5-5s
 ```
 
+延迟时间可通过环境变量调整，单位是纳秒：
+
+```yaml
+DELAY_NS: 4000000000  # 约 4 秒
+```
+
+路径名里的 `-5s` 只是名称，实际延迟以 `DELAY_NS` 为准。
+
 ## 直接运行镜像
 
 推荐使用 host 网络：
@@ -81,6 +125,7 @@ rtsp://127.0.0.1:8554/camera5 -> rtsp://127.0.0.1:8554/camera5-5s
 ```bash
 docker run --rm -it --network=host \
   -e MEDIAMTX_CONFIG=/config/mediamtx.yml \
+  -e DELAY_NS=4000000000 \
   -v ./mediamtx.yml:/config/mediamtx.yml:ro \
   -v ./recordings:/data/recordings \
   -v ./media_cache:/app/proxy/media_cache \

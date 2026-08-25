@@ -10,6 +10,7 @@ services:
     environment:
       MEDIAMTX_CONFIG: /config/mediamtx.yml
       MEDIAMTX_BASE: http://localhost:9996
+      DELAY_NS: 4000000000
     volumes:
       - ./mediamtx.yml:/config/mediamtx.yml:ro
       - ./recordings:/data/recordings
