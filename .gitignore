@@ -1,0 +1,13 @@
+proxy/node_modules/
+proxy/media_cache/
+
+*.log
+__pycache__/
+*.pyc
+
+data/
+recordings/
+mediacache/
+
+# Local runtime config may contain camera credentials.
+mediamtx.yml

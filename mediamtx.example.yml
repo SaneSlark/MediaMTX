@@ -1,0 +1,71 @@
+logLevel: info
+logDestinations: [stdout, file]
+logFile: /var/log/mediamtx.log
+
+api: yes
+apiAddress: :9997
+metrics: yes
+metricsAddress: :9998
+pprof: yes
+pprofAddress: :9999
+
+playback: yes
+playbackAddress: :9996
+
+rtmp: yes
+rtmpAddress: :1935
+
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [tcp, udp]
+
+hls: yes
+hlsAddress: :8888
+hlsSegmentDuration: 1s
+hlsPartDuration: 2s
+hlsSegmentCount: 10
+hlsAlwaysRemux: yes
+
+webrtc: yes
+webrtcAddress: :8889
+webrtcLocalUDPAddress: :8189
+webrtcAdditionalHosts: [YOUR_PUBLIC_OR_LAN_IP]
+
+srt: yes
+srtAddress: :8890
+
+authMethod: internal
+authInternalUsers:
+  - user: admin
+    pass: CHANGE_ME
+    ips: []
+    permissions:
+      - action: api
+      - action: metrics
+      - action: pprof
+
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: read
+      - action: publish
+      - action: playback
+
+pathDefaults:
+  useAbsoluteTimestamp: false
+  sourceOnDemand: no
+  rtspTransport: tcp
+
+paths:
+  camera1:
+    source: rtsp://USER:PASSWORD@CAMERA_HOST:554/unicast/c1/s0/live
+    record: yes
+    recordPath: /data/recordings/%path/%Y%m%d_%H%M%S_%f
+    recordFormat: fmp4
+    recordPartDuration: 10s
+    recordSegmentDuration: 1h
+    recordDeleteAfter: 2160h
+
+  camera1-5s:
+    source: publisher

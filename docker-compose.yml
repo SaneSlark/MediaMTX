@@ -1,0 +1,16 @@
+services:
+  mediamtx:
+    image: ghcr.io/saneslark/mediamtx:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mediamtx
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      MEDIAMTX_CONFIG: /config/mediamtx.yml
+      MEDIAMTX_BASE: http://localhost:9996
+    volumes:
+      - ./mediamtx.yml:/config/mediamtx.yml:ro
+      - ./recordings:/data/recordings
+      - ./mediacache:/app/proxy/media_cache
