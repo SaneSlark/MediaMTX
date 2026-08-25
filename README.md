@@ -9,7 +9,7 @@
 - MediaMTX：负责 RTSP/RTMP/HLS/WebRTC/SRT 拉流、发布、录制和回放。
 - 录像保存：按 `mediamtx.yml` 中的 `recordPath` 保存到容器内 `/data/recordings`，Compose 默认映射到本地 `./recordings`。
 - 回放代理：`proxy/proxy.js` 提供 `/get` 接口，把 MediaMTX playback 的片段下载后用 FFmpeg 整理为浏览器友好的 MP4，并支持 HTTP Range 拖动播放。
-- 缓存管理：回放代理会把生成后的 MP4 缓存在 `/app/proxy/media_cache`，Compose 默认映射到本地 `./mediacache`。
+- 缓存管理：回放代理会把生成后的 MP4 缓存在 `/app/proxy/media_cache`，Compose 默认映射到本地 `./media_cache`。
 - 延迟转发：`delay/camera.py` 会读取 `mediamtx.yml` 的 `paths`，自动识别 `camera1` / `camera1-5s` 这类配对路径，并用 GStreamer 做约 5 秒延迟转发。
 - 自动扩展摄像头：新增摄像头只需要改 `mediamtx.yml` 的 `paths`，不需要再改 Python 或 Node 代码。
 
@@ -45,7 +45,7 @@ Compose 默认使用本地目录：
 
 ```text
 ./recordings   -> /data/recordings
-./mediacache   -> /app/proxy/media_cache
+./media_cache  -> /app/proxy/media_cache
 ./mediamtx.yml -> /config/mediamtx.yml
 ```
 
@@ -83,7 +83,7 @@ docker run --rm -it --network=host \
   -e MEDIAMTX_CONFIG=/config/mediamtx.yml \
   -v ./mediamtx.yml:/config/mediamtx.yml:ro \
   -v ./recordings:/data/recordings \
-  -v ./mediacache:/app/proxy/media_cache \
+  -v ./media_cache:/app/proxy/media_cache \
   ghcr.io/saneslark/mediamtx:latest
 ```
 
@@ -101,6 +101,6 @@ docker run --rm -it \
   -p 9997:9997 \
   -v ./mediamtx.yml:/config/mediamtx.yml:ro \
   -v ./recordings:/data/recordings \
-  -v ./mediacache:/app/proxy/media_cache \
+  -v ./media_cache:/app/proxy/media_cache \
   ghcr.io/saneslark/mediamtx:latest
 ```

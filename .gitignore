@@ -8,6 +8,7 @@ __pycache__/
 data/
 recordings/
 mediacache/
+media_cache/
 
 # Local runtime config may contain camera credentials.
 mediamtx.yml
