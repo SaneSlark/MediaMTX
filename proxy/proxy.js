@@ -10,14 +10,33 @@ const { spawn } = require('child_process');
 
 const app = express();
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function readBoolean(envName, defaultValue = false) {
+  const value = process.env[envName];
+  if (value === undefined) {
+    return defaultValue;
+  }
+  return ['1', 'true', 'yes', 'on'].includes(value.toLowerCase());
+}
+
+function readDurationMs(msEnvName, daysEnvName, defaultDays) {
+  if (process.env[msEnvName]) {
+    return Number(process.env[msEnvName]);
+  }
+  const value = process.env[daysEnvName] === undefined ? defaultDays : process.env[daysEnvName];
+  return Number(value) * DAY_MS;
+}
+
 /* ================== 基础配置 ================== */
 const CONFIG = {
   PORT: Number(process.env.PORT || 9995),
   MEDIAMTX_BASE: process.env.MEDIAMTX_BASE || 'http://localhost:9996',
   CACHE_DIR: process.env.CACHE_DIR || path.join(__dirname, 'media_cache'),
   TEMP_DIR: process.env.TEMP_DIR || '/dev/shm',
-  CACHE_TTL_MS: Number(process.env.CACHE_TTL_MS || 360 * 24 * 60 * 60 * 1000),
-  CLEAN_INTERVAL_MS: Number(process.env.CLEAN_INTERVAL_MS || 20 * 24 * 60 * 60 * 1000),
+  CACHE_KEEP_FOREVER: readBoolean('CACHE_KEEP_FOREVER'),
+  CACHE_TTL_MS: readDurationMs('CACHE_TTL_MS', 'CACHE_TTL_DAYS', 90),
+  CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INTERVAL_DAYS', 1),
   FFMPEG_TIMEOUT_MS: Number(process.env.FFMPEG_TIMEOUT_MS || 60000),
   MAX_DURATION: Number(process.env.MAX_DURATION || 3600),
 };
@@ -169,6 +188,11 @@ function serveRange(filePath, req, res, totalSize) {
 
 // 递归清理超过 TTL 的缓存文件，同时移除空目录。
 async function cleanCache(dir = CONFIG.CACHE_DIR) {
+  if (CONFIG.CACHE_KEEP_FOREVER) {
+    console.log('[SYSTEM] cache cleanup skipped, CACHE_KEEP_FOREVER is enabled');
+    return;
+  }
+
   const now = Date.now();
   const files = [];
 
@@ -253,7 +277,7 @@ app.get('/get', async (req, res) => {
 
     if (await fs.pathExists(cacheFile)) {
       const stat = await fs.stat(cacheFile);
-      if (Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS) {
+      if (CONFIG.CACHE_KEEP_FOREVER || Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS) {
         return serveRange(cacheFile, req, res, stat.size);
       }
       await fs.unlink(cacheFile).catch(() => {});

@@ -49,6 +49,24 @@ Compose 默认使用本地目录：
 ./mediamtx.yml -> /config/mediamtx.yml
 ```
 
+## 缓存保留时间
+
+回放代理生成的 MP4 缓存在 `./media_cache`，默认保留 90 天，每天清理一次。可以在 `docker-compose.yml` 里调整：
+
+```yaml
+CACHE_KEEP_FOREVER: "false"
+CACHE_TTL_DAYS: 90
+CLEAN_INTERVAL_DAYS: 1
+```
+
+如果要永久保留缓存，设置：
+
+```yaml
+CACHE_KEEP_FOREVER: "true"
+```
+
+如果需要更精确的毫秒级配置，也可以使用 `CACHE_TTL_MS` 和 `CLEAN_INTERVAL_MS`。
+
 ## 录像回放列表
 
 MediaMTX 回放列表接口：

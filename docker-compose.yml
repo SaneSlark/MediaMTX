@@ -11,6 +11,14 @@ services:
       MEDIAMTX_CONFIG: /config/mediamtx.yml
       MEDIAMTX_BASE: http://localhost:9996
       DELAY_NS: 4000000000
+      CACHE_KEEP_FOREVER: "false"
+      CACHE_TTL_DAYS: 90
+      CLEAN_INTERVAL_DAYS: 1
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     volumes:
       - ./mediamtx.yml:/config/mediamtx.yml:ro
       - ./recordings:/data/recordings

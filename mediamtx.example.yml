@@ -1,6 +1,5 @@
 logLevel: info
-logDestinations: [stdout, file]
-logFile: /var/log/mediamtx.log
+logDestinations: [stdout]
 
 api: yes
 apiAddress: :9997
