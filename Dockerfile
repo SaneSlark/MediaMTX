@@ -34,7 +34,7 @@ WORKDIR /app
 COPY proxy/package*.json ./proxy/
 RUN cd proxy && npm ci --omit=dev
 
-COPY proxy/proxy.js ./proxy/proxy.js
+COPY proxy/replay-proxy.js ./proxy/replay-proxy.js
 COPY delay ./delay
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 

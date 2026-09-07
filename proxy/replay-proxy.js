@@ -7,6 +7,7 @@ const https = require('https');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const { pipeline } = require('stream/promises');
 
 const app = express();
 
@@ -38,8 +39,18 @@ const CONFIG = {
   CACHE_TTL_MS: readDurationMs('CACHE_TTL_MS', 'CACHE_TTL_DAYS', 90),
   CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INTERVAL_DAYS', 1),
   FFMPEG_TIMEOUT_MS: Number(process.env.FFMPEG_TIMEOUT_MS || 60000),
+  DOWNLOAD_TIMEOUT_MS: Number(process.env.DOWNLOAD_TIMEOUT_MS || 120000),
   MAX_DURATION: Number(process.env.MAX_DURATION || 3600),
 };
+
+for (const key of ['CACHE_TTL_MS', 'CLEAN_INTERVAL_MS', 'FFMPEG_TIMEOUT_MS', 'DOWNLOAD_TIMEOUT_MS', 'MAX_DURATION']) {
+  if (!Number.isFinite(CONFIG[key]) || CONFIG[key] <= 0) {
+    throw new Error(`${key} must be a positive finite number`);
+  }
+}
+for (const key of ['CLEAN_INTERVAL_MS', 'FFMPEG_TIMEOUT_MS', 'DOWNLOAD_TIMEOUT_MS']) {
+  if (CONFIG[key] > 2147483647) throw new Error(`${key} exceeds the Node.js timer limit`);
+}
 
 fs.ensureDirSync(CONFIG.CACHE_DIR);
 fs.ensureDirSync(CONFIG.TEMP_DIR);
@@ -124,13 +135,14 @@ function runFFmpeg(inputFile, outputFile, timeoutMs) {
 
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let stderr = '';
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       proc.kill('SIGKILL');
-      reject(new Error('FFmpeg timeout'));
     }, timeoutMs);
 
     proc.stderr.on('data', (data) => {
-      stderr += data.toString();
+      stderr = (stderr + data.toString()).slice(-65536);
     });
 
     proc.on('error', (error) => {
@@ -140,7 +152,9 @@ function runFFmpeg(inputFile, outputFile, timeoutMs) {
 
     proc.on('close', (code) => {
       clearTimeout(timer);
-      if (code === 0) {
+      if (timedOut) {
+        reject(new Error('FFmpeg timeout'));
+      } else if (code === 0) {
         resolve();
       } else {
         reject(new Error(stderr || `ffmpeg exited with code ${code}`));
@@ -152,7 +166,7 @@ function runFFmpeg(inputFile, outputFile, timeoutMs) {
 /* ================== Range 播放 ================== */
 
 // 支持 HTTP Range 请求，让浏览器可以拖动播放进度。
-function serveRange(filePath, req, res, totalSize) {
+async function serveRange(filePath, req, res, totalSize) {
   const range = req.headers.range;
   const baseHeaders = {
     'Content-Type': 'video/mp4',
@@ -164,14 +178,19 @@ function serveRange(filePath, req, res, totalSize) {
 
   if (!range) {
     res.set({ ...baseHeaders, 'Content-Length': totalSize });
-    return fs.createReadStream(filePath).pipe(res);
+    return sendFileStream(filePath, res);
   }
 
-  const [startText, endText] = range.replace(/bytes=/, '').split('-');
-  const start = Number.parseInt(startText, 10);
-  const end = endText ? Number.parseInt(endText, 10) : totalSize - 1;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+  // 不支持多区间或无法识别的 Range 时，忽略该头并返回完整文件。
+  if (!match || (!match[1] && !match[2])) {
+    res.set({ ...baseHeaders, 'Content-Length': totalSize });
+    return sendFileStream(filePath, res);
+  }
+  const start = match[1] ? Number(match[1]) : Math.max(0, totalSize - Number(match[2]));
+  const end = match[1] && match[2] ? Math.min(Number(match[2]), totalSize - 1) : totalSize - 1;
 
-  if (Number.isNaN(start) || Number.isNaN(end) || start >= totalSize || end >= totalSize || start > end) {
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= totalSize || start > end) {
     return res.status(416).set('Content-Range', `bytes */${totalSize}`).end();
   }
 
@@ -181,7 +200,16 @@ function serveRange(filePath, req, res, totalSize) {
     'Content-Length': end - start + 1,
   });
 
-  return fs.createReadStream(filePath, { start, end }).pipe(res);
+  return sendFileStream(filePath, res, { start, end });
+}
+
+async function sendFileStream(filePath, res, options) {
+  try {
+    await pipeline(fs.createReadStream(filePath, options), res);
+  } catch (error) {
+    // pipeline 同时关闭文件和响应，客户端断开或文件读取失败不会成为未处理异常。
+    if (error.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.error('File streaming failed:', error.message);
+  }
 }
 
 /* ================== 缓存清理 ================== */
@@ -206,7 +234,7 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
         if (remain.length === 0) {
           await fs.rmdir(fullPath).catch(() => {});
         }
-      } else {
+      } else if (entry.isFile() && entry.name.endsWith('.mp4') && !entry.name.endsWith('.partial.mp4')) {
         const stat = await fs.stat(fullPath);
         files.push({ fullPath, stat });
       }
@@ -227,28 +255,27 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
 }
 
 // 从 MediaMTX playback 接口下载原始片段到临时文件。
-function downloadFile(sourceUrl, targetFile) {
-  return new Promise((resolve, reject) => {
-    const client = sourceUrl.startsWith('https:') ? https : http;
-    const request = client.get(sourceUrl, (response) => {
-      if (response.statusCode !== 200) {
-        response.resume();
-        reject(new Error(`MediaMTX returned ${response.statusCode}`));
-        return;
-      }
-
-      const writer = fs.createWriteStream(targetFile);
-      response.pipe(writer);
-      writer.on('finish', resolve);
-      writer.on('error', reject);
+async function downloadFile(sourceUrl, targetFile) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIG.DOWNLOAD_TIMEOUT_MS);
+  try {
+    await new Promise((resolve, reject) => {
+      const client = sourceUrl.startsWith('https:') ? https : http;
+      const request = client.get(sourceUrl, { signal: controller.signal }, (response) => {
+        if (response.statusCode !== 200) {
+          response.resume();
+          reject(new Error(`MediaMTX returned ${response.statusCode}`));
+          return;
+        }
+        pipeline(response, fs.createWriteStream(targetFile), { signal: controller.signal }).then(resolve, reject);
+      });
+      request.on('error', reject);
     });
-
-    request.on('error', reject);
-    request.end();
-  });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
-// 防止同一个视频片段被多个并发请求重复生成。
 const generating = new Set();
 
 /* ================== 主接口 ================== */
@@ -259,6 +286,9 @@ app.get('/get', async (req, res) => {
 
   try {
     const query = req.query;
+    if (Object.values(query).some((value) => typeof value !== 'string')) {
+      return res.status(400).send('Query parameters must be single string values');
+    }
     if (!query.path || !query.start || !query.duration) {
       return res.status(400).send('Missing parameters: path, start, duration');
     }
@@ -275,36 +305,40 @@ app.get('/get', async (req, res) => {
       return res.status(400).send(error.message);
     }
 
-    if (await fs.pathExists(cacheFile)) {
-      const stat = await fs.stat(cacheFile);
-      if (CONFIG.CACHE_KEEP_FOREVER || Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS) {
-        return serveRange(cacheFile, req, res, stat.size);
-      }
-      await fs.unlink(cacheFile).catch(() => {});
-    }
-
     if (generating.has(cacheFile)) {
       return res.status(202).send('Video is being generated');
     }
-
     generating.add(cacheFile);
-    const tempFile = path.join(CONFIG.TEMP_DIR, `${crypto.randomBytes(16).toString('hex')}.tmp.mp4`);
-
     try {
-      const enhancedQuery = { ...query, format: 'mp4' };
-      const sourceUrl = `${CONFIG.MEDIAMTX_BASE}/get?${new URLSearchParams(enhancedQuery).toString()}`;
+      if (await fs.pathExists(cacheFile)) {
+        const stat = await fs.stat(cacheFile);
+        if (CONFIG.CACHE_KEEP_FOREVER || Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS) {
+          return serveRange(cacheFile, req, res, stat.size);
+        }
+        await fs.unlink(cacheFile).catch(() => {});
+      }
 
-      await downloadFile(sourceUrl, tempFile);
-      await runFFmpeg(tempFile, cacheFile, CONFIG.FFMPEG_TIMEOUT_MS);
-      await fs.unlink(tempFile).catch(() => {});
+      const tempFile = path.join(CONFIG.TEMP_DIR, `${crypto.randomBytes(16).toString('hex')}.tmp.mp4`);
 
-      const stat = await fs.stat(cacheFile);
-      return serveRange(cacheFile, req, res, stat.size);
-    } catch (error) {
-      await fs.unlink(tempFile).catch(() => {});
-      await fs.unlink(cacheFile).catch(() => {});
-      console.error(`${clientIP} video generation failed:`, error.message);
-      return res.status(500).send('Video generation failed');
+      const stagingFile = `${cacheFile}.${crypto.randomBytes(8).toString('hex')}.partial.mp4`;
+      try {
+        await fs.ensureDir(path.dirname(cacheFile));
+        const enhancedQuery = { ...query, format: 'mp4' };
+        const sourceUrl = `${CONFIG.MEDIAMTX_BASE}/get?${new URLSearchParams(enhancedQuery).toString()}`;
+
+        await downloadFile(sourceUrl, tempFile);
+        await runFFmpeg(tempFile, stagingFile, CONFIG.FFMPEG_TIMEOUT_MS);
+        await fs.rename(stagingFile, cacheFile);
+        await fs.unlink(tempFile).catch(() => {});
+
+        const stat = await fs.stat(cacheFile);
+        return serveRange(cacheFile, req, res, stat.size);
+      } catch (error) {
+        await fs.unlink(tempFile).catch(() => {});
+        await fs.unlink(stagingFile).catch(() => {});
+        console.error(`${clientIP} video generation failed:`, error.message);
+        return res.status(500).send('Video generation failed');
+      }
     } finally {
       generating.delete(cacheFile);
     }

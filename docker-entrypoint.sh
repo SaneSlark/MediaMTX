@@ -21,7 +21,7 @@ trap shutdown SIGINT SIGTERM
 mediamtx "$MEDIAMTX_CONFIG" &
 pids+=("$!")
 
-python3 /app/delay/camera.py &
+python3 /app/delay/camera-delay.py &
 pids+=("$!")
 
 npm --prefix /app/proxy start &

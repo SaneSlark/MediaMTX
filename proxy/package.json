@@ -2,9 +2,9 @@
   "name": "proxy",
   "version": "1.0.0",
   "description": "",
-  "main": "proxy.js",
+  "main": "replay-proxy.js",
   "scripts": {
-    "start": "node proxy.js",
+    "start": "node replay-proxy.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

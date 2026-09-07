@@ -21,6 +21,8 @@ MediaMTX RTSP 延迟转发管理器。
 import os
 import signal
 import sys
+import threading
+import time
 
 import gi
 import yaml
@@ -36,13 +38,17 @@ MEDIAMTX_CONFIG = os.environ.get("MEDIAMTX_CONFIG", "/config/mediamtx.yml")
 RTSP_BASE = os.environ.get("RTSP_BASE", "rtsp://127.0.0.1:8554")
 DELAYED_SUFFIX = os.environ.get("DELAYED_SUFFIX", "-5s")
 DELAY_NS = int(os.environ.get("DELAY_NS", "5000000000"))
-RETRY_INTERVAL = int(os.environ.get("RETRY_INTERVAL", "60"))
+RETRY_INTERVAL = int(os.environ.get("RETRY_INTERVAL", "30"))
+STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "30"))
+if DELAY_NS < 0 or RETRY_INTERVAL <= 0 or STALL_TIMEOUT <= 0:
+    raise ValueError("DELAY_NS must be >= 0; RETRY_INTERVAL and STALL_TIMEOUT must be > 0")
 
 # GStreamer pipeline 参数：读取原始 RTSP 流，缓存 5 秒后推送到延迟流。
 PIPELINE_CMD = (
     'rtspsrc location="{source}" protocols=tcp latency=0 ! '
     "rtph264depay ! h264parse ! "
-    "queue max-size-buffers=0 max-size-bytes=0 "
+    "queue name=delay_queue max-size-buffers=0 max-size-bytes=0 "
+    "max-size-time={queue_ns} "
     "min-threshold-time={delay_ns} leaky=0 ! "
     'rtspclientsink location="{sink}" protocols=tcp'
 )
@@ -95,19 +101,42 @@ class CameraPipeline:
         self.bus_handler_id = None
         self.retry_timer_id = None
         self.running = False
+        self.stopped = False
+        self.watchdog_id = None
+        self.cleanup_thread = None
+        self.activity = None
 
     def build_pipeline(self):
         desc = PIPELINE_CMD.format(
             source=self.source,
             sink=self.sink,
             delay_ns=DELAY_NS,
+            queue_ns=DELAY_NS + 2 * Gst.SECOND,
         )
         self.pipeline = Gst.parse_launch(desc)
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
         self.bus_handler_id = self.bus.connect("message", self.bus_message)
+        # 回调运行在流线程中，只更新时间；主循环负责状态切换。
+        activity = {"input": None, "output": None}
+        self.activity = activity
+        queue = self.pipeline.get_by_name("delay_queue")
+        for pad_name, key in (("sink", "input"), ("src", "output")):
+            queue.get_static_pad(pad_name).add_probe(
+                Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, key)
+            )
+
+    @staticmethod
+    def buffer_seen(pad, info, data):
+        activity, key = data
+        activity[key] = time.monotonic()
+        return Gst.PadProbeReturn.OK
 
     def destroy_pipeline(self):
+        self.running = False
+        if self.watchdog_id is not None:
+            GLib.source_remove(self.watchdog_id)
+            self.watchdog_id = None
         if not self.pipeline:
             return
 
@@ -118,34 +147,78 @@ class CameraPipeline:
             self.bus_handler_id = None
             self.bus.remove_signal_watch()
 
-        self.pipeline.set_state(Gst.State.NULL)
-        self.pipeline.get_state(Gst.CLOCK_TIME_NONE)
+        pipeline = self.pipeline
         self.pipeline = None
         self.bus = None
+        self.activity = None
+        # set_state(NULL) 本身也可能阻塞，不能放在共用的主循环中。
+        # 同一路旧实例退出前不创建新实例，避免重复发布和线程累积。
+        self.cleanup_thread = threading.Thread(
+            target=self.cleanup_pipeline, args=(pipeline,), daemon=True
+        )
+        self.cleanup_thread.start()
+
+    def cleanup_pipeline(self, pipeline):
+        try:
+            pipeline.set_state(Gst.State.NULL)
+        except Exception as exc:
+            print(f"[{self.name}] cleanup failed: {exc}")
 
     def start(self):
-        if self.pipeline:
+        if self.stopped or self.pipeline:
+            return
+        if self.cleanup_thread is not None and self.cleanup_thread.is_alive():
+            print(f"[{self.name}] waiting for previous pipeline cleanup")
+            self.schedule_retry()
             return
 
         print(f"[{self.name}] starting pipeline: {self.source} -> {self.sink}")
-        self.build_pipeline()
-        ret = self.pipeline.set_state(Gst.State.PLAYING)
+        try:
+            self.started_at = time.monotonic()
+            self.build_pipeline()
+            ret = self.pipeline.set_state(Gst.State.PLAYING)
+            if ret == Gst.StateChangeReturn.FAILURE:
+                raise RuntimeError("playing failed immediately")
+            self.watchdog_id = GLib.timeout_add_seconds(1, self.check_activity)
+        except Exception as exc:
+            self.fail(f"start failed: {exc}")
 
-        if ret == Gst.StateChangeReturn.FAILURE:
-            print(f"[{self.name}] playing failed immediately")
-            self.running = False
-            self.schedule_retry()
-        else:
+    def fail(self, reason):
+        print(f"[{self.name}] {reason}")
+        self.destroy_pipeline()
+        self.schedule_retry()
+
+    def check_activity(self):
+        now = time.monotonic()
+        activity = self.activity
+        if self.stopped or activity is None:
+            self.watchdog_id = None
+            return False
+        last_input = activity["input"]
+        last_output = activity["output"]
+        # 首次输出需额外允许延迟队列填满。
+        input_stalled = now - (last_input if last_input is not None else self.started_at) > STALL_TIMEOUT
+        output_stalled = now - (last_output if last_output is not None else self.started_at) > (
+            STALL_TIMEOUT + DELAY_NS / Gst.SECOND
+        )
+        if input_stalled or output_stalled:
+            self.watchdog_id = None
+            self.fail("video stalled, reconnecting")
+            return False
+        if last_output is not None and not self.running:
             self.running = True
+            print(f"[{self.name}] video flowing to publisher")
+        return True
 
     def stop(self):
         print(f"[{self.name}] stopping")
+        self.stopped = True
         self.running = False
         self.cancel_retry()
         self.destroy_pipeline()
 
     def schedule_retry(self):
-        if self.retry_timer_id is not None:
+        if self.stopped or self.retry_timer_id is not None:
             return
 
         # 单路异常后进入定时重试，不影响其它摄像头。
@@ -158,29 +231,23 @@ class CameraPipeline:
             self.retry_timer_id = None
 
     def retry_tick(self):
-        print(f"[{self.name}] retry tick")
-        self.destroy_pipeline()
-        self.start()
-
-        if self.running:
-            print(f"[{self.name}] recovered")
-            self.retry_timer_id = None
+        # 单次定时器：异步启动失败时可以立即安排下一次重试。
+        self.retry_timer_id = None
+        if self.stopped:
             return False
-        return True
+        print(f"[{self.name}] retry tick")
+        self.start()
+        return False
 
     def bus_message(self, bus, msg):
+        if self.stopped or bus != self.bus:
+            return True
         msg_type = msg.type
         if msg_type == Gst.MessageType.ERROR:
             err, _ = msg.parse_error()
-            print(f"[{self.name}] ERROR: {err}")
-            self.running = False
-            self.destroy_pipeline()
-            self.schedule_retry()
+            self.fail(f"ERROR: {err}")
         elif msg_type == Gst.MessageType.EOS:
-            print(f"[{self.name}] EOS")
-            self.running = False
-            self.destroy_pipeline()
-            self.schedule_retry()
+            self.fail("EOS")
         return True
 
 
