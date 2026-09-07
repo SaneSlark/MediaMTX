@@ -120,6 +120,8 @@ class CameraPipeline:
         self.stopped = False
         self.watchdog_id = None
         self.cleanup_thread = None
+        # 多路流的 pad-added 可能在不同流线程中并发触发，用锁串行化。
+        self.pad_lock = threading.Lock()
         # 每路音视频流一项：{"media", "activity", "started_at"}。
         self.streams = []
 
@@ -145,7 +147,14 @@ class CameraPipeline:
         self.bus_handler_id = self.bus.connect("message", self.bus_message)
 
     def on_pad_added(self, src, pad):
-        # 运行在流线程中；为新出现的流挂接 depay -> parse -> queue 链。
+        with self.pad_lock:
+            try:
+                self.link_stream(pad)
+            except Exception as exc:
+                print(f"[{self.name}] failed to add stream: {exc}", flush=True)
+
+    def link_stream(self, pad):
+        # 运行在流线程中（pad_lock 保护下）；为新出现的流挂接 depay -> parse -> queue 链。
         caps = pad.get_current_caps() or pad.query_caps(None)
         structure = caps.get_structure(0)
         media = structure.get_string("media") or ""
@@ -171,7 +180,8 @@ class CameraPipeline:
                 return
             elements.append(element)
 
-        queue = Gst.ElementFactory.make("queue", f"delay_queue_{len(self.streams)}")
+        # 不指定名字，由 GStreamer 自动分配唯一名称；探针用引用而非名字定位。
+        queue = Gst.ElementFactory.make("queue", None)
         queue.set_property("max-size-buffers", 0)
         queue.set_property("max-size-bytes", 0)
         queue.set_property("max-size-time", DELAY_NS + 2 * Gst.SECOND)
