@@ -47,6 +47,10 @@ CLEANUP_TIMEOUT = 15
 if DELAY_NS < 0 or RETRY_INTERVAL <= 0 or STALL_TIMEOUT <= 0:
     raise ValueError("DELAY_NS must be >= 0; RETRY_INTERVAL and STALL_TIMEOUT must be > 0")
 
+# GstRTSPLowerTrans 的 TCP 标志位；该枚举在 GstRtsp 命名空间，容器内没有
+# 对应 typelib，直接用数值。
+RTSP_LOWER_TRANS_TCP = 4
+
 # 按 RTP caps 的 encoding-name 选择 depay/parse 链；rtspclientsink 会按
 # 解析后的 caps 自动重新打包回 RTP。
 STREAM_CHAINS = {
@@ -125,13 +129,13 @@ class CameraPipeline:
 
         self.rtspsrc = Gst.ElementFactory.make("rtspsrc", "source")
         self.rtspsrc.set_property("location", self.source)
-        self.rtspsrc.set_property("protocols", Gst.RTSPLowerTrans.TCP)
+        self.rtspsrc.set_property("protocols", RTSP_LOWER_TRANS_TCP)
         self.rtspsrc.set_property("latency", 0)
         self.rtspsrc.connect("pad-added", self.on_pad_added)
 
         self.client_sink = Gst.ElementFactory.make("rtspclientsink", "sink")
         self.client_sink.set_property("location", self.sink)
-        self.client_sink.set_property("protocols", Gst.RTSPLowerTrans.TCP)
+        self.client_sink.set_property("protocols", RTSP_LOWER_TRANS_TCP)
 
         self.pipeline.add(self.rtspsrc)
         self.pipeline.add(self.client_sink)
