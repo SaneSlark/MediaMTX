@@ -9,6 +9,7 @@ services:
     network_mode: host
     shm_size: "1g"
     environment:
+      TZ: Asia/Shanghai
       MEDIAMTX_CONFIG: /config/mediamtx.yml
       MEDIAMTX_BASE: http://localhost:9996
       DELAY_NS: 5000000000
