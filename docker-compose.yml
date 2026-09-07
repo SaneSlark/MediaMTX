@@ -7,10 +7,11 @@ services:
     container_name: mediamtx
     restart: unless-stopped
     network_mode: host
+    shm_size: "1g"
     environment:
       MEDIAMTX_CONFIG: /config/mediamtx.yml
       MEDIAMTX_BASE: http://localhost:9996
-      DELAY_NS: 4000000000
+      DELAY_NS: 5000000000
       CACHE_KEEP_FOREVER: "false"
       CACHE_TTL_DAYS: 90
       CLEAN_INTERVAL_DAYS: 1

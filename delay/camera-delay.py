@@ -16,6 +16,9 @@ MediaMTX RTSP 延迟转发管理器。
 会自动生成：
 
   rtsp://127.0.0.1:8554/camera1 -> rtsp://127.0.0.1:8554/camera1-5s
+
+视频和音频会一起延迟转发，每路流使用相同
+延迟参数的 queue，保持音画同步。
 """
 
 import os
@@ -40,18 +43,25 @@ DELAYED_SUFFIX = os.environ.get("DELAYED_SUFFIX", "-5s")
 DELAY_NS = int(os.environ.get("DELAY_NS", "5000000000"))
 RETRY_INTERVAL = int(os.environ.get("RETRY_INTERVAL", "30"))
 STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "30"))
+CLEANUP_TIMEOUT = 15
 if DELAY_NS < 0 or RETRY_INTERVAL <= 0 or STALL_TIMEOUT <= 0:
     raise ValueError("DELAY_NS must be >= 0; RETRY_INTERVAL and STALL_TIMEOUT must be > 0")
 
-# GStreamer pipeline 参数：读取原始 RTSP 流，缓存 5 秒后推送到延迟流。
-PIPELINE_CMD = (
-    'rtspsrc location="{source}" protocols=tcp latency=0 ! '
-    "rtph264depay ! h264parse ! "
-    "queue name=delay_queue max-size-buffers=0 max-size-bytes=0 "
-    "max-size-time={queue_ns} "
-    "min-threshold-time={delay_ns} leaky=0 ! "
-    'rtspclientsink location="{sink}" protocols=tcp'
-)
+# 按 RTP caps 的 encoding-name 选择 depay/parse 链；rtspclientsink 会按
+# 解析后的 caps 自动重新打包回 RTP。
+STREAM_CHAINS = {
+    "video": {
+        "H264": ("rtph264depay", "h264parse"),
+        "H265": ("rtph265depay", "h265parse"),
+    },
+    "audio": {
+        "PCMA": ("rtppcmadepay", None),
+        "PCMU": ("rtppcmudepay", None),
+        "MP4A-LATM": ("rtpmp4gdepay", "aacparse"),
+        "MPEG4-GENERIC": ("rtpmp4gdepay", "aacparse"),
+        "OPUS": ("rtpopusdepay", "opusparse"),
+    },
+}
 
 
 def load_cameras(config_path):
@@ -97,6 +107,8 @@ class CameraPipeline:
         self.source = cam["source"]
         self.sink = cam["sink"]
         self.pipeline = None
+        self.rtspsrc = None
+        self.client_sink = None
         self.bus = None
         self.bus_handler_id = None
         self.retry_timer_id = None
@@ -104,27 +116,93 @@ class CameraPipeline:
         self.stopped = False
         self.watchdog_id = None
         self.cleanup_thread = None
-        self.activity = None
+        # 每路音视频流一项：{"media", "activity", "started_at"}。
+        self.streams = []
 
     def build_pipeline(self):
-        desc = PIPELINE_CMD.format(
-            source=self.source,
-            sink=self.sink,
-            delay_ns=DELAY_NS,
-            queue_ns=DELAY_NS + 2 * Gst.SECOND,
-        )
-        self.pipeline = Gst.parse_launch(desc)
+        # rtspsrc 的音视频 pad 在协商出 SDP 后才出现，必须动态建链。
+        self.pipeline = Gst.Pipeline.new(f"{self.name}-pipeline")
+
+        self.rtspsrc = Gst.ElementFactory.make("rtspsrc", "source")
+        self.rtspsrc.set_property("location", self.source)
+        self.rtspsrc.set_property("protocols", Gst.RTSPLowerTrans.TCP)
+        self.rtspsrc.set_property("latency", 0)
+        self.rtspsrc.connect("pad-added", self.on_pad_added)
+
+        self.client_sink = Gst.ElementFactory.make("rtspclientsink", "sink")
+        self.client_sink.set_property("location", self.sink)
+        self.client_sink.set_property("protocols", Gst.RTSPLowerTrans.TCP)
+
+        self.pipeline.add(self.rtspsrc)
+        self.pipeline.add(self.client_sink)
+
         self.bus = self.pipeline.get_bus()
         self.bus.add_signal_watch()
         self.bus_handler_id = self.bus.connect("message", self.bus_message)
+
+    def on_pad_added(self, src, pad):
+        # 运行在流线程中；为新出现的流挂接 depay -> parse -> queue 链。
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        structure = caps.get_structure(0)
+        media = structure.get_string("media") or ""
+        encoding = structure.get_string("encoding-name") or ""
+        chain = STREAM_CHAINS.get(media, {}).get(encoding)
+        if chain is None:
+            print(f"[{self.name}] ignoring unsupported {media} stream ({encoding})", flush=True)
+            return
+
+        elements = []
+        for factory_name in chain:
+            if factory_name is None:
+                continue
+            element = Gst.ElementFactory.make(factory_name, None)
+            if element is None:
+                print(
+                    f"[{self.name}] missing GStreamer element {factory_name}; "
+                    f"skipping {media} stream ({encoding})",
+                    flush=True,
+                )
+                for e in elements:
+                    e.set_state(Gst.State.NULL)
+                return
+            elements.append(element)
+
+        queue = Gst.ElementFactory.make("queue", f"delay_queue_{len(self.streams)}")
+        queue.set_property("max-size-buffers", 0)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property("max-size-time", DELAY_NS + 2 * Gst.SECOND)
+        queue.set_property("min-threshold-time", DELAY_NS)
+        elements.append(queue)
+
+        for element in elements:
+            self.pipeline.add(element)
+        for upstream, downstream in zip(elements, elements[1:]):
+            if not upstream.link(downstream):
+                print(f"[{self.name}] failed to link {media} chain ({encoding})", flush=True)
+                return
+
+        sink_pad = self.client_sink.get_request_pad("sink_%u")
+        if sink_pad is None or queue.get_static_pad("src").link(sink_pad) != Gst.PadLinkReturn.OK:
+            print(f"[{self.name}] failed to link {media} stream to rtspclientsink", flush=True)
+            return
+        if pad.link(elements[0].get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            print(f"[{self.name}] failed to link rtspsrc {media} pad", flush=True)
+            self.client_sink.release_request_pad(sink_pad)
+            return
+
+        for element in elements:
+            element.sync_state_with_parent()
+
         # 回调运行在流线程中，只更新时间；主循环负责状态切换。
         activity = {"input": None, "output": None}
-        self.activity = activity
-        queue = self.pipeline.get_by_name("delay_queue")
-        for pad_name, key in (("sink", "input"), ("src", "output")):
-            queue.get_static_pad(pad_name).add_probe(
-                Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, key)
-            )
+        queue_sink = queue.get_static_pad("sink")
+        queue_src = queue.get_static_pad("src")
+        queue_sink.add_probe(Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, "input"))
+        queue_src.add_probe(Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, "output"))
+        self.streams.append(
+            {"media": media, "activity": activity, "started_at": time.monotonic()}
+        )
+        print(f"[{self.name}] delaying {media} stream ({encoding})", flush=True)
 
     @staticmethod
     def buffer_seen(pad, info, data):
@@ -149,14 +227,25 @@ class CameraPipeline:
 
         pipeline = self.pipeline
         self.pipeline = None
+        self.rtspsrc = None
+        self.client_sink = None
         self.bus = None
-        self.activity = None
+        self.streams = []
         # set_state(NULL) 本身也可能阻塞，不能放在共用的主循环中。
         # 同一路旧实例退出前不创建新实例，避免重复发布和线程累积。
         self.cleanup_thread = threading.Thread(
             target=self.cleanup_pipeline, args=(pipeline,), daemon=True
         )
         self.cleanup_thread.start()
+        GLib.timeout_add_seconds(CLEANUP_TIMEOUT, self.check_cleanup, self.cleanup_thread)
+
+    def check_cleanup(self, thread):
+        if thread.is_alive() and not self.stopped:
+            # A stuck native GStreamer thread cannot be killed safely in Python.
+            # Exit so the container supervisor restarts the service.
+            print(f"[{self.name}] cleanup timed out; restarting process", flush=True)
+            os._exit(1)
+        return False
 
     def cleanup_pipeline(self, pipeline):
         try:
@@ -174,7 +263,6 @@ class CameraPipeline:
 
         print(f"[{self.name}] starting pipeline: {self.source} -> {self.sink}")
         try:
-            self.started_at = time.monotonic()
             self.build_pipeline()
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
@@ -190,24 +278,31 @@ class CameraPipeline:
 
     def check_activity(self):
         now = time.monotonic()
-        activity = self.activity
-        if self.stopped or activity is None:
+        if self.stopped:
             self.watchdog_id = None
             return False
-        last_input = activity["input"]
-        last_output = activity["output"]
-        # 首次输出需额外允许延迟队列填满。
-        input_stalled = now - (last_input if last_input is not None else self.started_at) > STALL_TIMEOUT
-        output_stalled = now - (last_output if last_output is not None else self.started_at) > (
-            STALL_TIMEOUT + DELAY_NS / Gst.SECOND
-        )
-        if input_stalled or output_stalled:
-            self.watchdog_id = None
-            self.fail("video stalled, reconnecting")
-            return False
-        if last_output is not None and not self.running:
+        streams = self.streams
+        for stream in streams:
+            activity = stream["activity"]
+            last_input = activity["input"]
+            last_output = activity["output"]
+            started = stream["started_at"]
+            # 首次输出需额外允许延迟队列填满。
+            input_stalled = now - (last_input if last_input is not None else started) > STALL_TIMEOUT
+            output_stalled = now - (last_output if last_output is not None else started) > (
+                STALL_TIMEOUT + DELAY_NS / Gst.SECOND
+            )
+            if input_stalled or output_stalled:
+                self.watchdog_id = None
+                self.fail(f"{stream['media']} stalled, reconnecting")
+                return False
+        if (
+            not self.running
+            and streams
+            and all(s["activity"]["output"] is not None for s in streams)
+        ):
             self.running = True
-            print(f"[{self.name}] video flowing to publisher")
+            print(f"[{self.name}] streams flowing to publisher")
         return True
 
     def stop(self):
