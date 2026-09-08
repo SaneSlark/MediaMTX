@@ -8,20 +8,23 @@ services:
     restart: unless-stopped
     network_mode: host
     shm_size: "1g"
+
     environment:
       TZ: Asia/Shanghai
+      DELAY_NS: 5000000000
       MEDIAMTX_CONFIG: /config/mediamtx.yml
       MEDIAMTX_BASE: http://localhost:9996
-      DELAY_NS: 5000000000
       CACHE_KEEP_FOREVER: "false"
       CACHE_TTL_DAYS: 90
-      CLEAN_INTERVAL_DAYS: 1
+      CLEAN_INT_DAYS: 1
+
+    volumes:
+      - ./mediamtx.yml:/config/mediamtx.yml:ro
+      - ./media_cache:/app/proxy/media_cache
+      - ./recordings:/data/recordings
+
     logging:
       driver: json-file
       options:
         max-size: "50m"
         max-file: "3"
-    volumes:
-      - ./mediamtx.yml:/config/mediamtx.yml:ro
-      - ./recordings:/data/recordings
-      - ./media_cache:/app/proxy/media_cache

@@ -2,23 +2,17 @@
 """
 MediaMTX RTSP 延迟转发管理器。
 
-从 MEDIAMTX_CONFIG 指向的 mediamtx.yml 读取 paths，并自动为每个
-存在延迟发布路径的摄像头创建独立的 GStreamer pipeline。
+从 MEDIAMTX_CONFIG 指向的 mediamtx.yml 读取 paths，并自动为每个存在延迟发布路径的摄像头创建独立的 GStreamer pipeline。
 
 例如：
-
   camera1:
     source: rtsp://...
-
   camera1-5s:
     source: publisher
-
 会自动生成：
-
   rtsp://127.0.0.1:8554/camera1 -> rtsp://127.0.0.1:8554/camera1-5s
 
-视频和音频会一起延迟转发，每路流使用相同的管线时钟，
-由 clocksync 按时间戳执行固定延迟调度。
+视频和音频会一起延迟转发，每路流使用相同的管线时钟，由 clocksync 按时间戳执行固定延迟调度。
 """
 
 import os
@@ -48,12 +42,9 @@ CLEANUP_TIMEOUT = 15
 if DELAY_NS < 0 or RETRY_INTERVAL <= 0 or STALL_TIMEOUT <= 0:
     raise ValueError("DELAY_NS must be >= 0; RETRY_INTERVAL and STALL_TIMEOUT must be > 0")
 
-# GstRTSPLowerTrans 的 TCP 标志位；该枚举在 GstRtsp 命名空间，容器内没有
-# 对应 typelib，直接用数值。
+# GstRtsp.RTSPLowerTrans.TCP 的标志值；使用数值避免依赖 GstRtsp Python typelib。
+# 按 RTP caps 的 encoding-name 选择 depay/parse 链；rtspclientsink 会按解析后的 caps 自动重新打包回 RTP。
 RTSP_LOWER_TRANS_TCP = 4
-
-# 按 RTP caps 的 encoding-name 选择 depay/parse 链；rtspclientsink 会按
-# 解析后的 caps 自动重新打包回 RTP。
 STREAM_CHAINS = {
     "video": {
         "H264": ("rtph264depay", "h264parse"),
@@ -67,7 +58,6 @@ STREAM_CHAINS = {
         "OPUS": ("rtpopusdepay", "opusparse"),
     },
 }
-
 
 def load_cameras(config_path):
     # 从 mediamtx.yml 的 paths 自动识别需要延迟转发的摄像头。
@@ -101,9 +91,7 @@ def load_cameras(config_path):
                 "sink": f"{RTSP_BASE}/{delayed_name}",
             }
         )
-
     return cameras
-
 
 class CameraPipeline:
     """One connection attempt, in its own process. The parent owns retries."""
@@ -326,7 +314,14 @@ class CameraPipeline:
     def bus_message(self, bus, msg):
         if msg.type == Gst.MessageType.ERROR:
             error, debug = msg.parse_error()
-            self.fail(f"ERROR: {error}; {debug or ''}")
+            reason = getattr(error, "message", None) or str(error)
+            debug_text = debug or ""
+            for status in ("Unauthorized (401)", "Not Found (404)",
+                           "Internal Server Error (500)"):
+                if status.lower() in debug_text.lower():
+                    reason = status
+                    break
+            self.fail(f"ERROR: {reason}")
         elif msg.type == Gst.MessageType.EOS:
             self.fail("EOS")
 
@@ -355,10 +350,8 @@ class CameraPipeline:
             self.channel.close()
         return 1 if self.failed else 0
 
-
 def run_camera(cam, channel):
     raise SystemExit(CameraPipeline(cam, channel).run())
-
 
 class CameraProcess:
     """Independent, fixed-interval retries for one camera."""
@@ -430,7 +423,6 @@ class CameraProcess:
             self.process.terminate()
             self.kill_deadline = now + 3
 
-
 class RTSPManager:
     def __init__(self, cameras):
         context = multiprocessing.get_context("spawn")
@@ -461,7 +453,6 @@ class RTSPManager:
             for camera in workers:
                 camera.process.join(1)
                 camera.channel.close()
-
 
 if __name__ == "__main__":
     manager = RTSPManager(load_cameras(MEDIAMTX_CONFIG))

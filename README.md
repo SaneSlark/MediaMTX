@@ -13,6 +13,8 @@
 - 延迟转发：`delay/camera-delay.py` 会读取 `mediamtx.yml` 的 `paths`，自动识别 `camera1` / `camera1-5s` 这类配对路径，并用 GStreamer 做约 5 秒延迟转发。
 - 自动扩展摄像头：新增摄像头只需要改 `mediamtx.yml` 的 `paths`，不需要再改 Python 或 Node 代码。
 
+示例配置默认启用 RTSP、WebRTC、录像和回放；RTMP、HLS、SRT、MoQ 默认关闭，需要时可在 `mediamtx.yml` 中启用。
+
 ## 镜像构建
 
 GitHub Actions 会在推送到 `main` / `master`、推送 `v*` 标签、Pull Request 或手动触发时构建镜像，并发布到 GitHub Container Registry：
@@ -56,7 +58,7 @@ Compose 默认使用本地目录：
 ```yaml
 CACHE_KEEP_FOREVER: "false"
 CACHE_TTL_DAYS: 90
-CLEAN_INTERVAL_DAYS: 1
+CLEAN_INT_DAYS: 1
 ```
 
 如果要永久保留缓存，设置：
@@ -175,6 +177,10 @@ docker run --rm -it \
   -p 1935:1935 \
   -p 8888:8888 \
   -p 8889:8889 \
+  -p 8000:8000/udp \
+  -p 8001:8001/udp \
+  -p 8189:8189/udp \
+  -p 8890:8890/udp \
   -p 9995:9995 \
   -p 9996:9996 \
   -p 9997:9997 \

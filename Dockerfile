@@ -46,12 +46,16 @@ COPY proxy/replay-proxy.js ./proxy/replay-proxy.js
 COPY delay ./delay
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
-RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
+RUN cd /app/proxy \
+    && npm test \
+    && python3 -c "import ast; ast.parse(open('/app/delay/camera-delay.py', encoding='utf-8').read())" \
+    && bash -n /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh \
     && mkdir -p /data/recordings /var/log /app/proxy/media_cache
 
 VOLUME ["/data/recordings", "/app/proxy/media_cache"]
 
 EXPOSE 1935 8554 8888 8889 9995 9996 9997 9998 9999
-EXPOSE 8189/udp 8890/udp
+EXPOSE 8000/udp 8001/udp 8189/udp 8890/udp
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]

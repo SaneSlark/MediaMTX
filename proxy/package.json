@@ -5,13 +5,12 @@
   "main": "replay-proxy.js",
   "scripts": {
     "start": "node replay-proxy.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --check replay-proxy.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.13.2",
     "express": "^5.2.1",
     "fs-extra": "^11.3.3"
   }

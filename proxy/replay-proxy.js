@@ -32,12 +32,12 @@ function readDurationMs(msEnvName, daysEnvName, defaultDays) {
 /* ================== 基础配置 ================== */
 const CONFIG = {
   PORT: Number(process.env.PORT || 9995),
-  MEDIAMTX_BASE: process.env.MEDIAMTX_BASE || 'http://localhost:9996',
+  MEDIAMTX_BASE: (process.env.MEDIAMTX_BASE || 'http://localhost:9996').replace(/\/$/, ''),
   CACHE_DIR: process.env.CACHE_DIR || path.join(__dirname, 'media_cache'),
   TEMP_DIR: process.env.TEMP_DIR || '/dev/shm',
   CACHE_KEEP_FOREVER: readBoolean('CACHE_KEEP_FOREVER'),
   CACHE_TTL_MS: readDurationMs('CACHE_TTL_MS', 'CACHE_TTL_DAYS', 90),
-  CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INTERVAL_DAYS', 1),
+  CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INT_DAYS', 1),
   FFMPEG_TIMEOUT_MS: Number(process.env.FFMPEG_TIMEOUT_MS || 60000),
   DOWNLOAD_TIMEOUT_MS: Number(process.env.DOWNLOAD_TIMEOUT_MS || 120000),
   MAX_DURATION: Number(process.env.MAX_DURATION || 3600),
@@ -50,6 +50,9 @@ for (const key of ['CACHE_TTL_MS', 'CLEAN_INTERVAL_MS', 'FFMPEG_TIMEOUT_MS', 'DO
 }
 for (const key of ['CLEAN_INTERVAL_MS', 'FFMPEG_TIMEOUT_MS', 'DOWNLOAD_TIMEOUT_MS']) {
   if (CONFIG[key] > 2147483647) throw new Error(`${key} exceeds the Node.js timer limit`);
+}
+if (!Number.isInteger(CONFIG.PORT) || CONFIG.PORT < 1 || CONFIG.PORT > 65535) {
+  throw new Error('PORT must be an integer between 1 and 65535');
 }
 
 fs.ensureDirSync(CONFIG.CACHE_DIR);
@@ -92,11 +95,31 @@ function getCacheFile(query) {
   return path.join(dir, `${hash}.mp4`);
 }
 
+function parseQuery(query) {
+  if (Object.values(query).some((value) => typeof value !== 'string')) {
+    throw new Error('Query parameters must be single string values');
+  }
+  if (!query.path || !query.start || !query.duration) {
+    throw new Error('Missing parameters: path, start, duration');
+  }
+  if (!validatePathParam(query.path)) {
+    throw new Error('Invalid path parameter');
+  }
+  extractDate(query.start);
+
+  const duration = Number(query.duration);
+  if (!Number.isFinite(duration) || duration <= 0 || duration > CONFIG.MAX_DURATION) {
+    throw new Error(`duration must be positive and not exceed ${CONFIG.MAX_DURATION} seconds`);
+  }
+  return query;
+}
+
 // 获取客户端 IP，兼容反向代理头和 IPv6 映射的 IPv4 地址。
 function getClientIP(req) {
   const forwarded = req.headers['x-forwarded-for'];
   let clientIP = Array.isArray(forwarded) ? forwarded[0] : forwarded;
   clientIP = clientIP || req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown';
+  clientIP = clientIP.split(',')[0].trim();
   if (clientIP.startsWith('::ffff:')) {
     clientIP = clientIP.slice(7);
   }
@@ -221,36 +244,34 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
     return;
   }
 
-  const now = Date.now();
-  const files = [];
+  const expiresBefore = Date.now() - CONFIG.CACHE_TTL_MS;
+  let cleaned = 0;
 
-  async function collect(currentDir) {
+  async function cleanDirectory(currentDir, isRoot = false) {
     const entries = await fs.readdir(currentDir, { withFileTypes: true });
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
       if (entry.isDirectory()) {
-        await collect(fullPath);
-        const remain = await fs.readdir(fullPath);
-        if (remain.length === 0) {
-          await fs.rmdir(fullPath).catch(() => {});
-        }
+        await cleanDirectory(fullPath);
       } else if (entry.isFile() && entry.name.endsWith('.mp4') && !entry.name.endsWith('.partial.mp4')) {
         const stat = await fs.stat(fullPath);
-        files.push({ fullPath, stat });
+        if (stat.mtimeMs < expiresBefore) {
+          try {
+            await fs.unlink(fullPath);
+            cleaned += 1;
+          } catch (error) {
+            if (error.code !== 'ENOENT') throw error;
+          }
+        }
       }
     }
-  }
 
-  await collect(dir);
-
-  let cleaned = 0;
-  for (const { fullPath, stat } of files) {
-    if (now - stat.mtimeMs > CONFIG.CACHE_TTL_MS) {
-      await fs.unlink(fullPath).catch(() => {});
-      cleaned += 1;
+    if (!isRoot && (await fs.readdir(currentDir)).length === 0) {
+      await fs.rmdir(currentDir).catch(() => {});
     }
   }
 
+  await cleanDirectory(dir, true);
   console.log(`[SYSTEM] cache cleanup complete, deleted ${cleaned} files`);
 }
 
@@ -278,6 +299,43 @@ async function downloadFile(sourceUrl, targetFile) {
 
 const generating = new Set();
 
+async function getCachedFile(cacheFile) {
+  if (!(await fs.pathExists(cacheFile))) return null;
+
+  let stat;
+  try {
+    stat = await fs.stat(cacheFile);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+  const fresh = CONFIG.CACHE_KEEP_FOREVER || Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS;
+  if (fresh) return stat;
+
+  await fs.unlink(cacheFile).catch(() => {});
+  return null;
+}
+
+async function generateVideo(query, cacheFile) {
+  const id = crypto.randomBytes(16).toString('hex');
+  const tempFile = path.join(CONFIG.TEMP_DIR, `${id}.tmp.mp4`);
+  const stagingFile = `${cacheFile}.${id}.partial.mp4`;
+
+  try {
+    await fs.ensureDir(path.dirname(cacheFile));
+    const params = new URLSearchParams({ ...query, format: 'mp4' });
+    await downloadFile(`${CONFIG.MEDIAMTX_BASE}/get?${params}`, tempFile);
+    await runFFmpeg(tempFile, stagingFile, CONFIG.FFMPEG_TIMEOUT_MS);
+    await fs.rename(stagingFile, cacheFile);
+    return await fs.stat(cacheFile);
+  } finally {
+    await Promise.all([
+      fs.unlink(tempFile).catch(() => {}),
+      fs.unlink(stagingFile).catch(() => {}),
+    ]);
+  }
+}
+
 /* ================== 主接口 ================== */
 
 app.get('/get', async (req, res) => {
@@ -285,60 +343,29 @@ app.get('/get', async (req, res) => {
   console.log(`${clientIP} request: ${req.url}`);
 
   try {
-    const query = req.query;
-    if (Object.values(query).some((value) => typeof value !== 'string')) {
-      return res.status(400).send('Query parameters must be single string values');
-    }
-    if (!query.path || !query.start || !query.duration) {
-      return res.status(400).send('Missing parameters: path, start, duration');
-    }
-
-    const duration = Number(query.duration);
-    if (Number.isNaN(duration) || duration <= 0 || duration > CONFIG.MAX_DURATION) {
-      return res.status(400).send(`duration must be positive and not exceed ${CONFIG.MAX_DURATION} seconds`);
-    }
-
+    let query;
     let cacheFile;
     try {
+      query = parseQuery(req.query);
       cacheFile = getCacheFile(query);
     } catch (error) {
       return res.status(400).send(error.message);
     }
 
+    const cached = await getCachedFile(cacheFile);
+    if (cached) return serveRange(cacheFile, req, res, cached.size);
+
     if (generating.has(cacheFile)) {
       return res.status(202).send('Video is being generated');
     }
+
     generating.add(cacheFile);
     try {
-      if (await fs.pathExists(cacheFile)) {
-        const stat = await fs.stat(cacheFile);
-        if (CONFIG.CACHE_KEEP_FOREVER || Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS) {
-          return serveRange(cacheFile, req, res, stat.size);
-        }
-        await fs.unlink(cacheFile).catch(() => {});
-      }
-
-      const tempFile = path.join(CONFIG.TEMP_DIR, `${crypto.randomBytes(16).toString('hex')}.tmp.mp4`);
-
-      const stagingFile = `${cacheFile}.${crypto.randomBytes(8).toString('hex')}.partial.mp4`;
-      try {
-        await fs.ensureDir(path.dirname(cacheFile));
-        const enhancedQuery = { ...query, format: 'mp4' };
-        const sourceUrl = `${CONFIG.MEDIAMTX_BASE}/get?${new URLSearchParams(enhancedQuery).toString()}`;
-
-        await downloadFile(sourceUrl, tempFile);
-        await runFFmpeg(tempFile, stagingFile, CONFIG.FFMPEG_TIMEOUT_MS);
-        await fs.rename(stagingFile, cacheFile);
-        await fs.unlink(tempFile).catch(() => {});
-
-        const stat = await fs.stat(cacheFile);
-        return serveRange(cacheFile, req, res, stat.size);
-      } catch (error) {
-        await fs.unlink(tempFile).catch(() => {});
-        await fs.unlink(stagingFile).catch(() => {});
-        console.error(`${clientIP} video generation failed:`, error.message);
-        return res.status(500).send('Video generation failed');
-      }
+      const stat = await generateVideo(query, cacheFile);
+      return serveRange(cacheFile, req, res, stat.size);
+    } catch (error) {
+      console.error(`${clientIP} video generation failed:`, error.message);
+      return res.status(500).send('Video generation failed');
     } finally {
       generating.delete(cacheFile);
     }
