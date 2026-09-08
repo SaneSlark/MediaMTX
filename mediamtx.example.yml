@@ -1,46 +1,21 @@
+###############################################
+# Global settings -> General
+
 logLevel: info
 logDestinations: [stdout]
 
-api: yes
-apiAddress: :9997
-apiAllowOrigins: ['*']
-metrics: yes
-metricsAddress: :9998
-metricsAllowOrigins: ['*']
-pprof: yes
-pprofAddress: :9999
-pprofAllowOrigins: ['*']
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpMaxPayloadSize: 1452
+udpReadBufferSize: 0
 
-playback: yes
-playbackAddress: :9996
-playbackAllowOrigins: ['*']
-
-rtmp: yes
-rtmpAddress: :1935
-
-rtsp: yes
-rtspAddress: :8554
-rtspTransports: [tcp, udp]
-
-hls: yes
-hlsAddress: :8888
-hlsAllowOrigins: ['*']
-hlsSegmentDuration: 1s
-hlsPartDuration: 2s
-hlsSegmentCount: 10
-hlsAlwaysRemux: yes
-
-webrtc: yes
-webrtcAddress: :8889
-webrtcAllowOrigins: ['*']
-webrtcLocalUDPAddress: :8189
-webrtcAdditionalHosts: [YOUR_PUBLIC_OR_LAN_IP]
-
-srt: yes
-srtAddress: :8890
+###############################################
+# Global settings -> Authentication
 
 authMethod: internal
 authInternalUsers:
+  # Admin user
   - user: admin
     pass: CHANGE_ME
     ips: []
@@ -49,6 +24,7 @@ authInternalUsers:
       - action: metrics
       - action: pprof
 
+  # Default user
   - user: any
     pass:
     ips: []
@@ -57,10 +33,102 @@ authInternalUsers:
       - action: publish
       - action: playback
 
+###############################################
+# Global settings -> Control API
+
+api: true
+apiAddress: :9997
+apiEncryption: false
+apiAllowOrigins: ['*']
+apiTrustedProxies: []
+
+metrics: true
+metricsAddress: :9998
+metricsEncryption: false
+metricsAllowOrigins: ['*']
+metricsTrustedProxies: []
+
+pprof: true
+pprofAddress: :9999
+pprofEncryption: false
+pprofAllowOrigins: ['*']
+pprofTrustedProxies: []
+
+###############################################
+# Global settings -> Playback server
+
+playback: true
+playbackAddress: :9996
+playbackEncryption: false
+playbackAllowOrigins: ['*']
+playbackTrustedProxies: []
+
+###############################################
+# Global settings -> RTMP server
+
+rtmp: false
+rtmpAddress: :1935
+
+###############################################
+# Global settings -> RTSP server
+
+rtsp: true
+rtspAddress: :8554
+rtspTransports: [tcp, udp]
+
+###############################################
+# Global settings -> HLS server
+
+hls: false
+hlsAddress: :8888
+hlsEncryption: false
+hlsAllowOrigins: ['*']
+hlsTrustedProxies: []
+hlsAlwaysRemux: false
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsSegmentCount: 10
+
+###############################################
+# Global settings -> WebRTC server
+
+webrtc: true
+webrtcAddress: :8889
+webrtcEncryption: false
+webrtcAllowOrigins: ['*']
+webrtcTrustedProxies: []
+
+webrtcLocalUDPAddress: :8189
+# 公网或局域网访问时填写服务器可达的域名/IP。
+webrtcAdditionalHosts: []
+# webrtcICEServers2: [stun:stun.l.google.com:19302]
+
+###############################################
+# Global settings -> SRT server
+
+srt: false
+srtAddress: :8890
+
+###############################################
+# MoQ server
+
+moq: false
+moqQUICAddress: :8893
+moqHTTP2Address: :8892
+moqHTTP3Address: :8892
+moqAllowOrigins: ["*"]
+moqTrustedProxies: []
+
+###############################################
+# Default path settings
+
 pathDefaults:
   useAbsoluteTimestamp: false
-  sourceOnDemand: no
+  sourceOnDemand: false
   rtspTransport: tcp
+
+###############################################
+# Path settings
 
 paths:
   camera1:
@@ -70,7 +138,7 @@ paths:
     recordFormat: fmp4
     recordPartDuration: 10s
     recordSegmentDuration: 1h
-    recordDeleteAfter: 2160h
+    recordDeleteAfter: 30d
 
   camera1-5s:
     source: publisher
