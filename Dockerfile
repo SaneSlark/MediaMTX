@@ -1,6 +1,6 @@
 FROM bluenviron/mediamtx:latest AS mediamtx
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
@@ -25,6 +25,14 @@ RUN apt-get update \
         python3-gst-1.0 \
         python3-yaml \
         tini \
+    && for element in \
+        aacparse clocksync h264parse h265parse opusparse queue \
+        rtph264depay rtph265depay rtpmp4adepay rtpmp4gdepay \
+        rtpopusdepay rtppcmadepay rtppcmudepay \
+        rtspclientsink rtspsrc; do \
+        gst-inspect-1.0 "$element" >/dev/null || exit 1; \
+    done \
+    && gst-inspect-1.0 rtspsrc | grep -q 'tcp-timestamp' \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx

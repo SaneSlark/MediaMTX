@@ -17,8 +17,8 @@ MediaMTX RTSP 延迟转发管理器。
 
   rtsp://127.0.0.1:8554/camera1 -> rtsp://127.0.0.1:8554/camera1-5s
 
-视频和音频会一起延迟转发，每路流使用相同
-延迟参数的 queue 并保留源时间戳，实际音画同步需通过源流和播放器验证。
+视频和音频会一起延迟转发，每路流使用相同的管线时钟，
+由 clocksync 按时间戳执行固定延迟调度。
 """
 
 import os
@@ -123,6 +123,7 @@ class CameraPipeline:
         self.started_at = time.monotonic()
         self.sink_started = False
         self.reported_flow = False
+        self.next_queue_log = self.started_at + 60
 
     def notify(self, state):
         self.channel.send(state)
@@ -147,16 +148,31 @@ class CameraPipeline:
 
     def build_pipeline(self):
         self.pipeline = Gst.Pipeline.new(None)
+        # Use one monotonic clock for every audio/video scheduler in this camera.
+        self.pipeline.use_clock(Gst.SystemClock.obtain())
         self.rtspsrc = self.make("rtspsrc")
         self.rtspsrc.set_property("location", self.source)
         self.rtspsrc.set_property("protocols", RTSP_LOWER_TRANS_TCP)
-        self.rtspsrc.set_property("latency", 200)
+        self.rtspsrc.set_property("latency", 0)
+        self.rtspsrc.set_property("drop-on-latency", True)
         self.rtspsrc.set_property("tcp-timeout", STALL_TIMEOUT * 1000000)
+        tcp_timestamp = self.rtspsrc.find_property("tcp-timestamp")
+        if tcp_timestamp is not None:
+            # Prevent sender and receiver clock drift from accumulating on TCP.
+            self.rtspsrc.set_property("tcp-timestamp", True)
+            print(f"[{self.name}] TCP receive timestamps enabled", flush=True)
+        else:
+            print(
+                f"[{self.name}] GStreamer has no tcp-timestamp support; "
+                "sender clock drift correction is unavailable",
+                flush=True,
+            )
         self.rtspsrc.connect("select-stream", self.select_stream)
         self.rtspsrc.connect("pad-added", self.on_pad_added)
         self.client_sink = self.make("rtspclientsink")
         self.client_sink.set_property("location", self.sink)
         self.client_sink.set_property("protocols", RTSP_LOWER_TRANS_TCP)
+        self.client_sink.set_property("latency", 0)
         # Do not negotiate the publishing SDP until every selected track is linked.
         self.client_sink.set_locked_state(True)
         self.pipeline.add(self.rtspsrc)
@@ -189,12 +205,17 @@ class CameraPipeline:
     def prepare_stream(self, key, chain):
         elements = [self.make(factory) for factory in chain if factory]
         queue = self.make("queue")
+        clock_sync = self.make("clocksync")
         queue.set_property("max-size-buffers", 0)
         queue.set_property("max-size-bytes", 0)
-        queue.set_property("max-size-time", DELAY_NS)
-        queue.set_property("min-threshold-time", DELAY_NS)
-        queue.set_property("leaky", 0)
-        elements.append(queue)
+        # Capacity does not determine the delay. clocksync does. One second of
+        # headroom avoids dropping the first scheduled frame at the boundary.
+        queue.set_property("max-size-time", DELAY_NS + Gst.SECOND)
+        queue.set_property("min-threshold-time", 0)
+        queue.set_property("leaky", 2)
+        clock_sync.set_property("sync", True)
+        clock_sync.set_property("ts-offset", DELAY_NS)
+        elements.extend((queue, clock_sync))
         # Any failure tears down this whole attempt; never continue with a partial graph.
         for element in elements:
             self.pipeline.add(element)
@@ -204,14 +225,17 @@ class CameraPipeline:
         sink_pad = self.client_sink.request_pad_simple("sink_%u")
         if sink_pad is None:
             raise RuntimeError("cannot request publishing pad")
-        if queue.get_static_pad("src").link(sink_pad) != Gst.PadLinkReturn.OK:
+        if clock_sync.get_static_pad("src").link(sink_pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError("cannot link publishing pad")
         activity = {"input": None, "output": None}
-        for name, label in (("sink", "input"), ("src", "output")):
-            queue.get_static_pad(name).add_probe(
-                Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, label)
-            )
-        self.streams.append({"key": key, "elements": elements,
+        queue.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, "input")
+        )
+        clock_sync.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self.buffer_seen, (activity, "output")
+        )
+        self.streams.append({"key": key, "elements": elements, "queue": queue,
+                             "clock_sync": clock_sync,
                              "activity": activity, "linked": False})
 
     def on_pad_added(self, src, pad):
@@ -289,6 +313,13 @@ class CameraPipeline:
         if not self.reported_flow:
             print(f"[{self.name}] media flowing to publisher", flush=True)
             self.reported_flow = True
+        if now >= self.next_queue_log:
+            levels = ", ".join(
+                f"{stream['key'][0]}={stream['queue'].get_property('current-level-time') / Gst.SECOND:.3f}s"
+                for stream in streams
+            )
+            print(f"[{self.name}] queue levels: {levels}", flush=True)
+            self.next_queue_log = now + 60
         self.notify("flowing")
         return True
 

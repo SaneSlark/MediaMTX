@@ -21,7 +21,7 @@ GitHub Actions 会在推送到 `main` / `master`、推送 `v*` 标签、Pull Req
 ghcr.io/saneslark/mediamtx:latest
 ```
 
-Dockerfile 会从 `bluenviron/mediamtx:latest` 复制 MediaMTX 二进制，然后在最终 Ubuntu 镜像中安装运行依赖，包括 FFmpeg、GStreamer、Node.js 和 Python。
+Dockerfile 会从 `bluenviron/mediamtx:latest` 复制 MediaMTX 二进制，然后在最终 Ubuntu 26.04 LTS 镜像中安装运行依赖，包括 FFmpeg、GStreamer、Node.js 和 Python。Ubuntu 26.04 提供的 GStreamer 版本支持 RTSP TCP 接收时间戳，用于抑制长时间运行后的时钟漂移。
 
 ## 使用 Docker Compose 运行
 
@@ -142,7 +142,11 @@ DELAY_NS: 5000000000  # 约 5 秒
 
 清理超过 15 秒或子进程失去心跳时，管理进程只终止并重建该摄像头子进程，不退出整个容器。终止后 3 秒仍未退出则强制结束；旧进程未退出前不创建新实例。直接运行脚本也使用同一套管理机制。停止管理进程时会同时终止其摄像头子进程。
 
-音频建立后需有首次数据；后续静音或 DTX 不会单独触发整路重连。这样避免静音造成反复重连，但仅音频永久卡流时也不会主动重连。音视频使用相同缓冲参数并保留源时间戳，不转码；实际同步效果以及 H.265、G.711 等编码的播放兼容性取决于源流和播放器，不能只凭队列参数保证。源端声明音频却一直不发送数据时，该路会启动超时重试。
+音频建立后需有首次数据；后续静音或 DTX 不会单独触发整路重连。这样避免静音造成反复重连，但仅音频永久卡流时也不会主动重连。音视频使用相同管线时钟和延迟偏移，不转码；实际端到端同步以及 H.265、G.711 等编码的播放兼容性仍取决于源流和播放器。源端声明音频却一直不发送数据时，该路会启动超时重试。
+
+延迟由 GStreamer 单调时钟和 buffer 时间戳调度：`clocksync` 在原始时间戳上增加 `DELAY_NS`，到达目标时刻才释放数据。`queue` 只提供等待期间的存储空间，其容量比目标延迟多 1 秒以避免边界丢帧，这 1 秒不会加入计划延迟。队列满时丢弃最旧的数据，避免阻塞 RTSP/TCP 输入并在网络缓冲区继续累积延迟。
+
+RTSP over TCP 在运行时支持 `tcp-timestamp` 时，会使用数据接收时间抑制摄像头时钟与服务器时钟的长期漂移；旧版 GStreamer 不支持该属性时会打印提示。延迟脚本连接的是同机 MediaMTX，因此收发两端的附加 latency 均设为 0，内部 jitterbuffer 开启 `drop-on-latency`。日志每 60 秒输出一次各轨道的 `queue levels`；该值稳定但观看延迟继续增加时，额外延迟来自 MediaMTX 输出协议或播放器缓存。
 
 回放临时文件默认存放在内存盘 `/dev/shm`，可通过 `TEMP_DIR` 修改；Compose 已配置 `shm_size: "1g"` 覆盖 Docker 默认的 64MB。生成没有并发数量限制；`TEMP_DIR` 指向磁盘目录时，磁盘需要足够的可用空间。
 
