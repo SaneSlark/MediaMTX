@@ -17,7 +17,7 @@
 
 ## 镜像构建
 
-GitHub Actions 会在推送到 `main` / `master`、推送 `v*` 标签、Pull Request 或手动触发时构建镜像，并发布到 GitHub Container Registry：
+GitHub Actions 会在推送到 `main` / `master`、推送 `v*` 标签或手动触发时构建镜像并发布到 GitHub Container Registry；Pull Request 仅构建验证：
 
 ```bash
 ghcr.io/saneslark/mediamtx:latest
@@ -69,6 +69,10 @@ CACHE_KEEP_FOREVER: "true"
 
 如果需要更精确的毫秒级配置，也可以使用 `CACHE_TTL_MS` 和 `CLEAN_INTERVAL_MS`。
 
+缓存按摄像头和日期分目录保存，保留时间按文件修改时间计算。过期缓存会在请求时失效，定时清理仅删除过期的完整 MP4；`CACHE_KEEP_FOREVER` 开启时跳过过期检查和定时清理。
+
+原始录像独立管理：示例配置通过 `recordDeleteAfter: 30d` 保留 30 天，与 MP4 缓存保留期无关。
+
 ## 录像回放列表
 
 MediaMTX 回放列表接口：
@@ -95,15 +99,21 @@ http://服务器IP:9995/get?path=camera1&start=2026-08-25T10%3A00%3A00Z&duration
 
 参数说明：
 
-- `path`：摄像头路径。
+- `path`：摄像头路径，仅支持字母、数字、下划线和短横线。
 - `start`：开始时间，使用 URL 编码后的 RFC3339 时间。
-- `duration`：回放时长，单位秒。
+- `duration`：回放时长，单位秒，必须大于 0；默认上限 3600 秒，可通过 `MAX_DURATION` 调整。
+
+缓存命中后直接返回 MP4，支持 HTTP Range 拖动播放；相同片段正在生成时返回 `202`，客户端需稍后重试。参数无效返回 `400`，生成失败返回 `500`。
 
 健康检查：
 
 ```text
 http://服务器IP:9995/health
 ```
+
+回放临时文件默认放在 `/dev/shm`，可用 `TEMP_DIR` 修改；半成品放在缓存目录。任务结束时会尝试清理两者，进程异常退出的残留文件不由定时任务清理。Compose 已将共享内存设为 1 GB；不同片段的生成任务不限并发，需留足空间。
+
+下载和 FFmpeg 处理默认分别在 120 秒、60 秒后超时，可通过 `DOWNLOAD_TIMEOUT_MS`、`FFMPEG_TIMEOUT_MS` 调整。
 
 ## 新增摄像头
 
@@ -118,7 +128,7 @@ paths:
     recordFormat: fmp4
     recordPartDuration: 10s
     recordSegmentDuration: 1h
-    recordDeleteAfter: 2160h
+    recordDeleteAfter: 30d
 
   camera5-5s:
     source: publisher
@@ -138,30 +148,30 @@ DELAY_NS: 5000000000  # 约 5 秒
 
 路径名里的 `-5s` 只是名称，实际延迟以 `DELAY_NS` 为准。
 
-延迟转发按 RTP 协商信息选择编码：视频支持 H.264 和 H.265，音频支持 PCMA、PCMU、AAC（MP4A-LATM / MPEG4-GENERIC）和 Opus。每台摄像头选择第一条支持的视频轨道和第一条支持的音频轨道；无音频时仅转发视频，其它编码和额外轨道会跳过并打印日志。没有支持的视频轨道或建链失败时，该路进入重试。新增或修改摄像头配对后，需要执行 `docker compose restart mediamtx` 重新读取配置。
+新增或修改摄像头配对后，执行 `docker compose restart mediamtx` 使配置生效。
 
-每路摄像头使用独立子进程。每次失败且旧进程退出后，固定等待 30 秒重试，不增加等待时间、不限制重试次数，直到恢复或服务停止。`RETRY_INTERVAL` 可修改固定重试间隔。持续 30 秒无视频输入会触发重连，首次建链和输出检测额外预留配置的延迟时间，`STALL_TIMEOUT` 可修改检测阈值。
+## 延迟转发
 
-清理超过 15 秒或子进程失去心跳时，管理进程只终止并重建该摄像头子进程，不退出整个容器。终止后 3 秒仍未退出则强制结束；旧进程未退出前不创建新实例。直接运行脚本也使用同一套管理机制。停止管理进程时会同时终止其摄像头子进程。
+- **编码支持**：视频支持 H.264 / H.265；音频支持 PCMA、PCMU、AAC（MP4A-LATM / MPEG4-GENERIC）和 Opus。每路只转发首条支持的视频和音频轨道，不转码；无音频时仅转发视频。
+- **自动恢复**：每路摄像头独立运行，失败后默认每 30 秒重试，次数不限；连续 30 秒无视频输入触发重连。分别通过 `RETRY_INTERVAL`、`STALL_TIMEOUT` 调整。
+- **音频检测**：声明音频却始终无数据会触发启动超时；收到首次数据后，静音、DTX 或仅音频卡流不会单独触发重连。
 
-音频建立后需有首次数据；后续静音或 DTX 不会单独触发整路重连。这样避免静音造成反复重连，但仅音频永久卡流时也不会主动重连。音视频使用相同管线时钟和延迟偏移，不转码；实际端到端同步以及 H.265、G.711 等编码的播放兼容性仍取决于源流和播放器。源端声明音频却一直不发送数据时，该路会启动超时重试。
+## 运行机制与延迟排查
 
-延迟由 GStreamer 单调时钟和 buffer 时间戳调度：`clocksync` 在原始时间戳上增加 `DELAY_NS`，到达目标时刻才释放数据。`queue` 只提供等待期间的存储空间，其容量比目标延迟多 1 秒以避免边界丢帧，这 1 秒不会加入计划延迟。队列满时丢弃最旧的数据，避免阻塞 RTSP/TCP 输入并在网络缓冲区继续累积延迟。
-
-RTSP over TCP 在运行时支持 `tcp-timestamp` 时，会使用数据接收时间抑制摄像头时钟与服务器时钟的长期漂移；旧版 GStreamer 不支持该属性时会打印提示。延迟脚本连接的是同机 MediaMTX，因此收发两端的附加 latency 均设为 0，内部 jitterbuffer 开启 `drop-on-latency`。日志每 60 秒输出一次各轨道的 `queue levels`；该值稳定但观看延迟继续增加时，额外延迟来自 MediaMTX 输出协议或播放器缓存。
-
-回放临时文件默认存放在内存盘 `/dev/shm`，可通过 `TEMP_DIR` 修改；Compose 已配置 `shm_size: "1g"` 覆盖 Docker 默认的 64MB。生成没有并发数量限制；`TEMP_DIR` 指向磁盘目录时，磁盘需要足够的可用空间。
-
-定时清理只删除缓存目录中超过保留时间的完整 MP4；开启 `CACHE_KEEP_FOREVER` 时完全跳过清理。临时文件和半成品不做自动清理——默认放在 `/dev/shm`，容器删除后即清空。
+- **轨道选择**：不支持的编码和额外轨道会跳过并记录日志；无可用视频轨道或建链失败时重试。播放兼容性和端到端音画同步取决于源流及播放器。
+- **进程管理**：清理超过 15 秒或丢失心跳时，只重建对应摄像头子进程；终止后 3 秒未退出则强制结束。旧进程退出后才开始等待重试，首次建链和输出检测额外预留配置的延迟时间。直接运行脚本使用相同机制，停止管理进程会同时终止所有摄像头子进程。
+- **延迟调度**：`clocksync` 按单调时钟和原始时间戳加 `DELAY_NS` 释放数据。队列容量额外预留 1 秒，但不增加计划延迟；满时丢弃最旧数据，避免输入阻塞和延迟累积。
+- **时钟与缓冲**：支持时启用 `tcp-timestamp` 抑制长期时钟漂移，不支持则记录提示。连接同机 MediaMTX 时，收发附加 latency 均为 0，jitterbuffer 启用 `drop-on-latency`。
+- **排查入口**：日志每 60 秒输出各轨道的 `queue levels`。队列稳定但观看延迟持续增加时，可检查 MediaMTX 输出协议和播放器缓存。
 
 ## 直接运行镜像
 
 推荐使用 host 网络：
 
 ```bash
-docker run --rm -it --network=host \
+docker run --rm -it --network=host --shm-size=1g \
   -e MEDIAMTX_CONFIG=/config/mediamtx.yml \
-  -e DELAY_NS=4000000000 \
+  -e DELAY_NS=5000000000 \
   -v ./mediamtx.yml:/config/mediamtx.yml:ro \
   -v ./recordings:/data/recordings \
   -v ./media_cache:/app/proxy/media_cache \
@@ -171,7 +181,7 @@ docker run --rm -it --network=host \
 如果不使用 host 网络，需要按需映射端口：
 
 ```bash
-docker run --rm -it \
+docker run --rm -it --shm-size=1g \
   -e MEDIAMTX_CONFIG=/config/mediamtx.yml \
   -p 8554:8554 \
   -p 1935:1935 \
