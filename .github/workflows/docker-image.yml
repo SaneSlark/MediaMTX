@@ -77,6 +77,74 @@ jobs:
             ffmpeg -v error -i /tmp/replay-smoke.mp4 -f null -
           '
 
+      - name: Verify streamed playback and cache
+        run: |
+          docker run --rm -i --entrypoint sh mediamtx-replay:test <<'SH'
+          set -e
+          ffmpeg -v error -f lavfi -i color=c=black:s=64x64:r=5 \
+            -f lavfi -i anullsrc=r=44100:cl=mono -t 2 \
+            -c:v libx264 -threads 1 -c:a aac \
+            -movflags frag_keyframe+empty_moov /tmp/input.mp4
+          ffmpeg -v error -i /tmp/input.mp4 -an -c:v copy \
+            -movflags frag_keyframe+empty_moov /tmp/silent.mp4
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const fs = require('node:fs/promises');
+          const http = require('node:http');
+          const { spawnSync } = require('node:child_process');
+          process.env.CACHE_DIR = '/tmp/replay-cache';
+          process.env.DOWNLOAD_TIMEOUT_MS = '1000';
+          let upstream, proxy, requests = 0;
+          const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+          (async () => {
+            const audio = await fs.readFile('/tmp/input.mp4');
+            const silent = await fs.readFile('/tmp/silent.mp4');
+            upstream = http.createServer((req, res) => {
+              requests++;
+              const query = new URL(req.url, 'http://localhost').searchParams;
+              assert.equal(query.get('format'), 'fmp4');
+              if (query.get('path') === 'stall') return;
+              if (query.get('path') === 'broken') { res.writeHead(200); res.write('bad'); res.destroy(); return; }
+              if (query.get('path') === 'invalid') { res.end('not a video'); return; }
+              const data = query.get('path') === 'silent' ? silent : audio;
+              res.writeHead(200, { 'Content-Type': 'video/mp4' });
+              res.write(data.subarray(0, Math.floor(data.length / 2)));
+              setTimeout(() => res.end(data.subarray(Math.floor(data.length / 2))), 50);
+            });
+            await listen(upstream);
+            process.env.MEDIAMTX_BASE = `http://127.0.0.1:${upstream.address().port}`;
+            proxy = http.createServer(require('./replay-proxy').app);
+            await listen(proxy);
+            const base = `http://127.0.0.1:${proxy.address().port}`;
+            const url = camera => `${base}/get?path=${camera}&start=2026-10-29T10%3A00%3A00Z&duration=2`;
+            for (const camera of ['audio', 'silent']) {
+              const result = await fetch(url(camera));
+              assert.equal(result.status, 200);
+              const video = Buffer.from(await result.arrayBuffer());
+              await fs.writeFile('/tmp/output.mp4', video);
+              assert.equal(spawnSync('ffmpeg', ['-v', 'error', '-i', '/tmp/output.mp4', '-f', 'null', '-']).status, 0);
+              assert(video.indexOf(Buffer.from('moov')) < video.indexOf(Buffer.from('mdat')));
+              const before = requests;
+              const cached = await fetch(url(camera), { headers: { Range: 'bytes=0-31' } });
+              assert.equal(cached.status, 206);
+              assert.deepEqual(Buffer.from(await cached.arrayBuffer()), video.subarray(0, 32));
+              assert.equal(requests, before);
+            }
+            for (const camera of ['stall', 'broken', 'invalid']) {
+              assert.equal((await fetch(url(camera))).status, 500);
+            }
+            const files = await fs.readdir('/tmp/replay-cache', { recursive: true });
+            assert(!files.some(file => file.endsWith('.partial.mp4')));
+            assert.equal((await fetch(base + '/health')).status, 200);
+            console.log('PASS: streaming audio/silent MP4, decode, faststart, cached Range, timeout and error cleanup');
+          })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
+            for (const server of [proxy, upstream]) {
+              if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+            }
+          });
+          NODE
+          SH
+
       - name: Verify service startup and healthcheck
         run: |
           docker run -d --name replay-health mediamtx-replay:test

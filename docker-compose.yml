@@ -8,7 +8,6 @@ services:
     restart: unless-stopped
     ports:
       - "9995:9995"
-    shm_size: "1g"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 

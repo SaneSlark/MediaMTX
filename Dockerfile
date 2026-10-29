@@ -2,8 +2,7 @@ FROM node:22-alpine
 
 ENV NODE_ENV=production \
     PORT=9995 \
-    CACHE_DIR=/app/proxy/media_cache \
-    TEMP_DIR=/dev/shm
+    CACHE_DIR=/app/proxy/media_cache
 
 RUN apk add --no-cache ca-certificates ffmpeg tini
 

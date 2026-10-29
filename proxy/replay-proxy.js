@@ -35,7 +35,6 @@ const CONFIG = {
   PORT: Number(process.env.PORT || 9995),
   MEDIAMTX_BASE: (process.env.MEDIAMTX_BASE || 'http://localhost:9996').replace(/\/$/, ''),
   CACHE_DIR: process.env.CACHE_DIR || path.join(__dirname, 'media_cache'),
-  TEMP_DIR: process.env.TEMP_DIR || '/dev/shm',
   CACHE_KEEP_FOREVER: readBoolean('CACHE_KEEP_FOREVER', true),
   CACHE_TTL_MS: readDurationMs('CACHE_TTL_MS', 'CACHE_TTL_DAYS', 90),
   CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INT_DAYS', 1),
@@ -62,7 +61,6 @@ if (!Number.isInteger(CONFIG.PORT) || CONFIG.PORT < 1 || CONFIG.PORT > 65535) {
 }
 
 fs.ensureDirSync(CONFIG.CACHE_DIR);
-fs.ensureDirSync(CONFIG.TEMP_DIR);
 
 /* ================== 工具函数 ================== */
 
@@ -145,61 +143,80 @@ function getClientIP(req) {
 /* ================== FFmpeg 处理 ================== */
 
 // 将 MediaMTX 回放片段整理为浏览器友好的 MP4，并兼容有无音频的输入。
-function runFFmpeg(inputFile, outputFile, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-y',
-      '-fflags',
-      '+genpts',
-      '-analyzeduration',
-      '10000000',
-      '-probesize',
-      '10000000',
-      '-i',
-      inputFile,
-      '-map',
-      '0:v:0',
-      '-c:v',
-      'copy',
-      '-map',
-      '0:a:0?',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '128k',
-      '-movflags',
-      'faststart',
-      outputFile,
-    ];
+async function runFFmpeg(input, outputFile, timeoutMs) {
+  const streaming = typeof input !== 'string';
+  const args = [
+    '-y',
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-fflags',
+    '+genpts',
+    '-analyzeduration',
+    '10000000',
+    '-probesize',
+    '10000000',
+    '-i',
+    streaming ? 'pipe:0' : input,
+    '-map',
+    '0:v:0',
+    '-c:v',
+    'copy',
+    '-map',
+    '0:a:0?',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '128k',
+    '-movflags',
+    'faststart',
+    outputFile,
+  ];
 
-    const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      proc.kill('SIGKILL');
-    }, timeoutMs);
+  const proc = spawn('ffmpeg', args, { stdio: [streaming ? 'pipe' : 'ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  let timedOut = false;
+  const killOnTimeout = () => {
+    timedOut = true;
+    proc.kill('SIGKILL');
+  };
+  // While stdin is active, downloadFile owns the download timeout. Once the
+  // response ends, bound FFmpeg finishing even if its stdin is backpressured.
+  let timer = streaming ? null : setTimeout(killOnTimeout, timeoutMs);
+  const inputEnded = () => {
+    clearTimeout(timer);
+    timer = setTimeout(killOnTimeout, timeoutMs);
+  };
+  if (streaming) input.once('end', inputEnded);
 
-    proc.stderr.on('data', (data) => {
-      stderr = (stderr + data.toString()).slice(-65536);
-    });
+  proc.stderr.on('data', (data) => {
+    stderr = (stderr + data.toString()).slice(-65536);
+  });
 
-    proc.on('error', (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-
-    proc.on('close', (code) => {
-      clearTimeout(timer);
-      if (timedOut) {
-        reject(new Error('FFmpeg timeout'));
-      } else if (code === 0) {
-        resolve();
-      } else {
-        reject(new Error(stderr || `ffmpeg exited with code ${code}`));
-      }
+  const exited = new Promise((resolve, reject) => {
+    proc.once('error', reject);
+    proc.once('close', (code) => {
+      if (timedOut) reject(new Error('FFmpeg timeout'));
+      else if (code === 0) resolve();
+      else reject(new Error(stderr || `ffmpeg exited with code ${code}`));
     });
   });
+  const supplied = streaming
+    ? pipeline(input, proc.stdin)
+    : Promise.resolve();
+  try {
+    await Promise.all([exited, supplied]);
+  } catch (error) {
+    // Stop both sides, then wait for all handles to close before removing
+    // staging output. This also handles an upstream disconnect or EPIPE.
+    if (streaming) input.destroy();
+    proc.kill('SIGKILL');
+    await Promise.allSettled([exited, supplied]);
+    throw error;
+  } finally {
+    if (streaming) input.removeListener('end', inputEnded);
+    clearTimeout(timer);
+  }
 }
 
 /* ================== Range 播放 ================== */
@@ -308,8 +325,9 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
   console.log(`[SYSTEM] cache cleanup complete, deleted ${cleaned} files`);
 }
 
-// 从 MediaMTX playback 接口下载原始片段到临时文件。
-async function downloadFile(sourceUrl, targetFile) {
+// Stream fragmented MP4 from playback straight into FFmpeg. Downloading and
+// audio conversion overlap, without a second full-size raw temporary file.
+async function downloadFile(sourceUrl, outputFile) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CONFIG.DOWNLOAD_TIMEOUT_MS);
   try {
@@ -322,8 +340,8 @@ async function downloadFile(sourceUrl, targetFile) {
       response.destroy();
       throw new Error(`MediaMTX returned ${response.statusCode}`);
     }
-    // Await pipeline teardown before generateVideo removes the temporary file.
-    await pipeline(response, fs.createWriteStream(targetFile), { signal: controller.signal });
+    response.once('end', () => clearTimeout(timer));
+    await runFFmpeg(response, outputFile, CONFIG.FFMPEG_TIMEOUT_MS);
   } finally {
     clearTimeout(timer);
   }
@@ -348,22 +366,19 @@ async function getCachedFile(cacheFile) {
 
 async function generateVideo(query, cacheFile) {
   const id = crypto.randomBytes(16).toString('hex');
-  const tempFile = path.join(CONFIG.TEMP_DIR, `${id}.tmp.mp4`);
   const stagingFile = `${cacheFile}.${id}.partial.mp4`;
 
   try {
     await fs.ensureDir(path.dirname(cacheFile));
-    const params = new URLSearchParams({ ...query, format: 'mp4' });
-    await downloadFile(`${CONFIG.MEDIAMTX_BASE}/get?${params}`, tempFile);
-    await runFFmpeg(tempFile, stagingFile, CONFIG.FFMPEG_TIMEOUT_MS);
+    const params = new URLSearchParams({ ...query, format: 'fmp4' });
+    const started = Date.now();
+    await downloadFile(`${CONFIG.MEDIAMTX_BASE}/get?${params}`, stagingFile);
     if ((await fs.stat(stagingFile)).size === 0) throw new Error('FFmpeg produced an empty file');
     await fs.rename(stagingFile, cacheFile);
+    console.log(`[PERF] ${query.path} generated in ${Date.now() - started}ms (streaming fmp4)`);
     return await fs.stat(cacheFile);
   } finally {
-    await Promise.all([
-      fs.unlink(tempFile).catch(() => {}),
-      fs.unlink(stagingFile).catch(() => {}),
-    ]);
+    await fs.unlink(stagingFile).catch(() => {});
   }
 }
 
