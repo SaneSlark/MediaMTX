@@ -54,6 +54,34 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/replay' }}
             type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
 
+      - name: Build validation image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: mediamtx-replay:test
+          cache-from: type=gha,scope=replay
+
+      - name: Test image with real FFmpeg
+        run: |
+          docker run --rm \
+            -e REQUIRE_FFMPEG_TESTS=1 \
+            -v "$GITHUB_WORKSPACE/proxy/test:/app/proxy/test:ro" \
+            mediamtx-replay:test node --test test/replay-proxy.test.js
+
+      - name: Verify service startup and healthcheck
+        run: |
+          docker run -d --name replay-health mediamtx-replay:test
+          trap 'docker logs replay-health; docker rm -f replay-health' EXIT
+          for attempt in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' replay-health)
+            if [ "$status" = healthy ]; then exit 0; fi
+            if [ "$status" = unhealthy ]; then exit 1; fi
+            sleep 2
+          done
+          exit 1
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:

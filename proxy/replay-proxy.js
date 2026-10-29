@@ -2,6 +2,7 @@
 
 const express = require('express');
 const fs = require('fs-extra');
+const fileSystem = require('fs/promises');
 const http = require('http');
 const https = require('https');
 const path = require('path');
@@ -42,6 +43,11 @@ const CONFIG = {
   DOWNLOAD_TIMEOUT_MS: Number(process.env.DOWNLOAD_TIMEOUT_MS || 120000),
   MAX_DURATION: Number(process.env.MAX_DURATION || 3600),
 };
+
+const upstream = new URL(CONFIG.MEDIAMTX_BASE);
+if (!['http:', 'https:'].includes(upstream.protocol) || upstream.search || upstream.hash) {
+  throw new Error('MEDIAMTX_BASE must be an HTTP(S) base URL without a query or fragment');
+}
 
 for (const key of ['CACHE_TTL_MS', 'CLEAN_INTERVAL_MS', 'FFMPEG_TIMEOUT_MS', 'DOWNLOAD_TIMEOUT_MS', 'MAX_DURATION']) {
   if (!Number.isFinite(CONFIG[key]) || CONFIG[key] <= 0) {
@@ -87,12 +93,10 @@ function getCacheFile(query) {
     .reduce((result, key) => {
       result[key] = query[key];
       return result;
-    }, {});
+    }, Object.create(null));
 
   const hash = crypto.createHash('md5').update(JSON.stringify(sorted)).digest('hex');
-  const dir = path.join(CONFIG.CACHE_DIR, camera, date);
-  fs.ensureDirSync(dir);
-  return path.join(dir, `${hash}.mp4`);
+  return path.join(CONFIG.CACHE_DIR, camera, date, `${hash}.mp4`);
 }
 
 function parseQuery(query) {
@@ -105,13 +109,25 @@ function parseQuery(query) {
   if (!validatePathParam(query.path)) {
     throw new Error('Invalid path parameter');
   }
+  const timestamp = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/i.exec(query.start);
+  if (!timestamp) {
+    throw new Error('start must be an RFC3339 timestamp with a timezone');
+  }
+  const [year, month, day, hour, minute, second] = timestamp.slice(1).map(Number);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1] || hour > 23 || minute > 59 || second > 59) {
+    throw new Error('Invalid start time');
+  }
   extractDate(query.start);
 
   const duration = Number(query.duration);
   if (!Number.isFinite(duration) || duration <= 0 || duration > CONFIG.MAX_DURATION) {
     throw new Error(`duration must be positive and not exceed ${CONFIG.MAX_DURATION} seconds`);
   }
-  return query;
+  // The upstream is always requested as MP4; avoid separate cache entries for format.
+  const { format, ...params } = query;
+  return params;
 }
 
 // 获取客户端 IP，兼容反向代理头和 IPv6 映射的 IPv4 地址。
@@ -189,7 +205,7 @@ function runFFmpeg(inputFile, outputFile, timeoutMs) {
 /* ================== Range 播放 ================== */
 
 // 支持 HTTP Range 请求，让浏览器可以拖动播放进度。
-async function serveRange(filePath, req, res, totalSize) {
+async function serveRange(file, req, res, totalSize) {
   const range = req.headers.range;
   const baseHeaders = {
     'Content-Type': 'video/mp4',
@@ -199,22 +215,23 @@ async function serveRange(filePath, req, res, totalSize) {
     'Content-Disposition': 'inline',
   };
 
-  if (!range) {
+  if (!range || req.method === 'HEAD') {
     res.set({ ...baseHeaders, 'Content-Length': totalSize });
-    return sendFileStream(filePath, res);
+    if (req.method === 'HEAD') return res.end();
+    return sendFileStream(file, res);
   }
 
   const match = /^bytes=(\d*)-(\d*)$/.exec(range);
   // 不支持多区间或无法识别的 Range 时，忽略该头并返回完整文件。
   if (!match || (!match[1] && !match[2])) {
     res.set({ ...baseHeaders, 'Content-Length': totalSize });
-    return sendFileStream(filePath, res);
+    return sendFileStream(file, res);
   }
   const start = match[1] ? Number(match[1]) : Math.max(0, totalSize - Number(match[2]));
   const end = match[1] && match[2] ? Math.min(Number(match[2]), totalSize - 1) : totalSize - 1;
 
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start >= totalSize || start > end) {
-    return res.status(416).set('Content-Range', `bytes */${totalSize}`).end();
+    return res.status(416).set({ ...baseHeaders, 'Content-Range': `bytes */${totalSize}` }).end();
   }
 
   res.status(206).set({
@@ -223,12 +240,12 @@ async function serveRange(filePath, req, res, totalSize) {
     'Content-Length': end - start + 1,
   });
 
-  return sendFileStream(filePath, res, { start, end });
+  return sendFileStream(file, res, { start, end });
 }
 
-async function sendFileStream(filePath, res, options) {
+async function sendFileStream(file, res, options) {
   try {
-    await pipeline(fs.createReadStream(filePath, options), res);
+    await pipeline(file.createReadStream({ ...options, autoClose: false }), res);
   } catch (error) {
     // pipeline 同时关闭文件和响应，客户端断开或文件读取失败不会成为未处理异常。
     if (error.code !== 'ERR_STREAM_PREMATURE_CLOSE') console.error('File streaming failed:', error.message);
@@ -248,14 +265,27 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
   let cleaned = 0;
 
   async function cleanDirectory(currentDir, isRoot = false) {
-    const entries = await fs.readdir(currentDir, { withFileTypes: true });
+    let entries;
+    try {
+      entries = await fs.readdir(currentDir, { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
       if (entry.isDirectory()) {
         await cleanDirectory(fullPath);
       } else if (entry.isFile() && entry.name.endsWith('.mp4') && !entry.name.endsWith('.partial.mp4')) {
-        const stat = await fs.stat(fullPath);
-        if (stat.mtimeMs < expiresBefore) {
+        if (generating.has(fullPath)) continue;
+        let stat;
+        try {
+          stat = await fs.stat(fullPath);
+        } catch (error) {
+          if (error.code === 'ENOENT') continue;
+          throw error;
+        }
+        if (stat.mtimeMs < expiresBefore && !generating.has(fullPath)) {
           try {
             await fs.unlink(fullPath);
             cleaned += 1;
@@ -266,8 +296,11 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
       }
     }
 
-    if (!isRoot && (await fs.readdir(currentDir)).length === 0) {
-      await fs.rmdir(currentDir).catch(() => {});
+    if (!isRoot && ![...generating].some((file) => file.startsWith(currentDir + path.sep))) {
+      // rmdir only removes empty directories; concurrent generation may add a file.
+      await fs.rmdir(currentDir).catch((error) => {
+        if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
+      });
     }
   }
 
@@ -280,18 +313,17 @@ async function downloadFile(sourceUrl, targetFile) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), CONFIG.DOWNLOAD_TIMEOUT_MS);
   try {
-    await new Promise((resolve, reject) => {
+    const response = await new Promise((resolve, reject) => {
       const client = sourceUrl.startsWith('https:') ? https : http;
-      const request = client.get(sourceUrl, { signal: controller.signal }, (response) => {
-        if (response.statusCode !== 200) {
-          response.resume();
-          reject(new Error(`MediaMTX returned ${response.statusCode}`));
-          return;
-        }
-        pipeline(response, fs.createWriteStream(targetFile), { signal: controller.signal }).then(resolve, reject);
-      });
+      const request = client.get(sourceUrl, { signal: controller.signal }, resolve);
       request.on('error', reject);
     });
+    if (response.statusCode !== 200) {
+      response.destroy();
+      throw new Error(`MediaMTX returned ${response.statusCode}`);
+    }
+    // Await pipeline teardown before generateVideo removes the temporary file.
+    await pipeline(response, fs.createWriteStream(targetFile), { signal: controller.signal });
   } finally {
     clearTimeout(timer);
   }
@@ -300,8 +332,6 @@ async function downloadFile(sourceUrl, targetFile) {
 const generating = new Set();
 
 async function getCachedFile(cacheFile) {
-  if (!(await fs.pathExists(cacheFile))) return null;
-
   let stat;
   try {
     stat = await fs.stat(cacheFile);
@@ -310,7 +340,7 @@ async function getCachedFile(cacheFile) {
     throw error;
   }
   const fresh = CONFIG.CACHE_KEEP_FOREVER || Date.now() - stat.mtimeMs < CONFIG.CACHE_TTL_MS;
-  if (fresh) return stat;
+  if (fresh && stat.isFile() && stat.size > 0) return stat;
 
   await fs.unlink(cacheFile).catch(() => {});
   return null;
@@ -326,6 +356,7 @@ async function generateVideo(query, cacheFile) {
     const params = new URLSearchParams({ ...query, format: 'mp4' });
     await downloadFile(`${CONFIG.MEDIAMTX_BASE}/get?${params}`, tempFile);
     await runFFmpeg(tempFile, stagingFile, CONFIG.FFMPEG_TIMEOUT_MS);
+    if ((await fs.stat(stagingFile)).size === 0) throw new Error('FFmpeg produced an empty file');
     await fs.rename(stagingFile, cacheFile);
     return await fs.stat(cacheFile);
   } finally {
@@ -338,6 +369,17 @@ async function generateVideo(query, cacheFile) {
 
 /* ================== 主接口 ================== */
 
+app.use((req, res, next) => {
+  res.set({
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Range',
+    'Access-Control-Expose-Headers': 'Accept-Ranges, Content-Length, Content-Range, Retry-After',
+  });
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.get('/get', async (req, res) => {
   const clientIP = getClientIP(req);
   console.log(`${clientIP} request: ${req.url}`);
@@ -347,31 +389,46 @@ app.get('/get', async (req, res) => {
     let cacheFile;
     try {
       query = parseQuery(req.query);
-      cacheFile = getCacheFile(query);
     } catch (error) {
       return res.status(400).send(error.message);
     }
+    cacheFile = getCacheFile(query);
 
-    const cached = await getCachedFile(cacheFile);
-    if (cached) return serveRange(cacheFile, req, res, cached.size);
-
+    // Acquire before the first asynchronous cache operation so expired-cache
+    // requests cannot delete or replace a file another request just generated.
     if (generating.has(cacheFile)) {
-      return res.status(202).send('Video is being generated');
+      return res.status(202).set('Retry-After', '1').send('Video is being generated');
     }
 
     generating.add(cacheFile);
+    let file;
     try {
-      const stat = await generateVideo(query, cacheFile);
-      return serveRange(cacheFile, req, res, stat.size);
+      if (!(await getCachedFile(cacheFile))) await generateVideo(query, cacheFile);
+      // Open once and use fstat on the same descriptor. Cleanup or replacement
+      // of the pathname cannot change the file being sent to this client.
+      try {
+        file = await fileSystem.open(cacheFile, 'r');
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        await generateVideo(query, cacheFile);
+        file = await fileSystem.open(cacheFile, 'r');
+      }
     } catch (error) {
       console.error(`${clientIP} video generation failed:`, error.message);
       return res.status(500).send('Video generation failed');
     } finally {
       generating.delete(cacheFile);
     }
+    try {
+      const stat = await file.stat();
+      return await serveRange(file, req, res, stat.size);
+    } finally {
+      await file.close();
+    }
   } catch (error) {
     console.error(`${clientIP} server error:`, error);
-    return res.status(500).send('Internal server error');
+    if (!res.headersSent && !res.destroyed) return res.status(500).send('Internal server error');
+    res.destroy();
   }
 });
 
@@ -382,15 +439,28 @@ app.get('/health', (req, res) => {
 
 /* ================== 定时任务和启动 ================== */
 
-setInterval(() => {
-  cleanCache().catch((error) => console.error('[SYSTEM] cache cleanup failed:', error));
-}, CONFIG.CLEAN_INTERVAL_MS);
+if (require.main === module) {
+  let cleaning = false;
+  setInterval(async () => {
+    if (cleaning) return;
+    cleaning = true;
+    try {
+      await cleanCache();
+    } catch (error) {
+      console.error('[SYSTEM] cache cleanup failed:', error);
+    } finally {
+      cleaning = false;
+    }
+  }, CONFIG.CLEAN_INTERVAL_MS).unref();
 
-app.listen(CONFIG.PORT, () => {
-  console.log('===========================================');
-  console.log('MediaMTX video proxy started');
-  console.log(`Proxy: http://localhost:${CONFIG.PORT}`);
-  console.log(`MediaMTX playback: ${CONFIG.MEDIAMTX_BASE}`);
-  console.log(`Cache directory: ${CONFIG.CACHE_DIR}`);
-  console.log('===========================================');
-});
+  app.listen(CONFIG.PORT, () => {
+    console.log('===========================================');
+    console.log('MediaMTX video proxy started');
+    console.log(`Proxy: http://localhost:${CONFIG.PORT}`);
+    console.log(`MediaMTX playback: ${CONFIG.MEDIAMTX_BASE}`);
+    console.log(`Cache directory: ${CONFIG.CACHE_DIR}`);
+    console.log('===========================================');
+  });
+}
+
+module.exports = { app, cleanCache, CONFIG, runFFmpeg };

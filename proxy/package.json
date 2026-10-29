@@ -1,11 +1,12 @@
 {
-  "name": "proxy",
+  "name": "mediamtx-replay",
   "version": "1.0.0",
-  "description": "",
+  "description": "Standalone MediaMTX playback proxy with MP4 caching and HTTP Range support",
   "main": "replay-proxy.js",
   "scripts": {
     "start": "node replay-proxy.js",
-    "test": "node --check replay-proxy.js"
+    "test": "node --test test/*.test.js",
+    "check": "node --check replay-proxy.js"
   },
   "keywords": [],
   "author": "",

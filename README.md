@@ -20,6 +20,8 @@ MEDIAMTX_BASE=http://192.168.1.100:9996
 
 然后重新执行 `docker compose up -d`。如果 MediaMTX 在其他容器中，需要让两个容器加入同一个 Docker 网络，并把 `MEDIAMTX_BASE` 设置为对应服务地址。
 
+可以复制 `.env.example` 为 `.env` 后修改；`.env` 已排除出 Git 和镜像构建上下文。
+
 如果同机原有完整服务已占用 `9995`，请先修改本分支 Compose 的宿主机端口映射，例如 `9994:9995`。
 
 也可以单独构建和运行（将示例服务器地址替换为实际地址）：
@@ -88,3 +90,18 @@ http://localhost:9995/get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=6
 临时文件与生成中的半成品会在任务结束时清理，进程异常退出的残留不由定时任务清理。不同片段可并发生成，请根据录像码率、时长和并发量调整共享内存大小。
 
 Docker 内置 `/health` 健康检查，仅检查代理进程是否可响应；上游连接和 FFmpeg 处理需要实际回放请求验证。
+
+## 源码与验证
+
+分支只保留回放代理源码、依赖锁文件、自动化测试和 Docker 部署配置。完整服务的 `delay/`、`docker-entrypoint.sh` 和 `mediamtx.example.yml` 已移除。
+
+```bash
+cd proxy
+npm ci
+npm run check
+npm test
+```
+
+测试覆盖参数校验、CORS、Range/HEAD、缓存过期与永久保留、并发去重、上游错误、超时和下载中断清理。安装 FFmpeg 后，还会验证有声/无声 MP4 生成、实际解码、faststart、缓存复用、损坏媒体与 FFmpeg 超时；本地缺少 FFmpeg 时这三组测试会跳过。
+
+GitHub Actions 在实际构建出的镜像内强制执行全部测试，再检查默认启动命令和 Docker 健康检查，通过后才发布镜像。测试代码通过只读挂载提供，不进入发布镜像。测试使用临时目录和模拟 playback 上游，不连接生产摄像头。

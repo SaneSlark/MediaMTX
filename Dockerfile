@@ -15,7 +15,7 @@ COPY proxy/package*.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 COPY proxy/replay-proxy.js ./replay-proxy.js
-RUN npm test && mkdir -p /app/proxy/media_cache
+RUN npm run check && mkdir -p /app/proxy/media_cache
 
 VOLUME ["/app/proxy/media_cache"]
 EXPOSE 9995

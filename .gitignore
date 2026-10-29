@@ -2,8 +2,7 @@ proxy/node_modules/
 proxy/media_cache/
 
 *.log
-__pycache__/
-*.pyc
+.env
 
 data/
 recordings/
