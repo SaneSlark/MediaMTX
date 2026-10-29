@@ -1,61 +1,27 @@
-FROM bluenviron/mediamtx:latest AS mediamtx
+FROM node:22-bookworm-slim
 
-FROM ubuntu:26.04
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV NODE_ENV=production
+ENV NODE_ENV=production \
+    PORT=9995 \
+    CACHE_DIR=/app/proxy/media_cache \
+    TEMP_DIR=/dev/shm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        bash \
-        ca-certificates \
-        ffmpeg \
-        gstreamer1.0-alsa \
-        gstreamer1.0-libav \
-        gstreamer1.0-plugins-bad \
-        gstreamer1.0-plugins-base \
-        gstreamer1.0-plugins-good \
-        gstreamer1.0-plugins-ugly \
-        gstreamer1.0-rtsp \
-        gstreamer1.0-tools \
-        nodejs \
-        npm \
-        python3 \
-        python3-gi \
-        python3-gst-1.0 \
-        python3-yaml \
-        tini \
-    && for element in \
-        aacparse clocksync h264parse h265parse opusparse queue \
-        rtph264depay rtph265depay rtpmp4adepay rtpmp4gdepay \
-        rtpopusdepay rtppcmadepay rtppcmudepay \
-        rtspclientsink rtspsrc; do \
-        gst-inspect-1.0 "$element" >/dev/null || exit 1; \
-    done \
-    && gst-inspect-1.0 rtspsrc | grep -q 'tcp-timestamp' \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg tini \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=mediamtx /mediamtx /usr/local/bin/mediamtx
+WORKDIR /app/proxy
 
-WORKDIR /app
+COPY proxy/package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 
-COPY proxy/package*.json ./proxy/
-RUN cd proxy && npm ci --omit=dev
+COPY proxy/replay-proxy.js ./replay-proxy.js
+RUN npm test && mkdir -p /app/proxy/media_cache
 
-COPY proxy/replay-proxy.js ./proxy/replay-proxy.js
-COPY delay ./delay
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+VOLUME ["/app/proxy/media_cache"]
+EXPOSE 9995
 
-RUN cd /app/proxy \
-    && npm test \
-    && python3 -c "import ast; ast.parse(open('/app/delay/camera-delay.py', encoding='utf-8').read())" \
-    && bash -n /usr/local/bin/docker-entrypoint.sh \
-    && chmod +x /usr/local/bin/docker-entrypoint.sh \
-    && mkdir -p /data/recordings /var/log /app/proxy/media_cache
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD node -e "fetch('http://127.0.0.1:' + process.env.PORT + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-VOLUME ["/data/recordings", "/app/proxy/media_cache"]
-
-EXPOSE 1935 8554 8888 8889 9995 9996 9997 9998 9999
-EXPOSE 8000/udp 8001/udp 8189/udp 8890/udp
-
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+CMD ["node", "replay-proxy.js"]

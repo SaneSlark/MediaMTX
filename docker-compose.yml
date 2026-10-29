@@ -1,27 +1,27 @@
 services:
-  mediamtx:
-    image: ghcr.io/saneslark/mediamtx:latest
+  replay:
+    image: ghcr.io/saneslark/mediamtx-replay:latest
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: mediamtx
+    container_name: mediamtx-replay
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "9995:9995"
     shm_size: "1g"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     environment:
       TZ: Asia/Shanghai
-      DELAY_NS: 5000000000
-      MEDIAMTX_CONFIG: /config/mediamtx.yml
-      MEDIAMTX_BASE: http://localhost:9996
+      PORT: 9995
+      MEDIAMTX_BASE: ${MEDIAMTX_BASE:-http://host.docker.internal:9996}
       CACHE_KEEP_FOREVER: "false"
       CACHE_TTL_DAYS: 90
       CLEAN_INT_DAYS: 1
 
     volumes:
-      - ./mediamtx.yml:/config/mediamtx.yml:ro
       - ./media_cache:/app/proxy/media_cache
-      - ./recordings:/data/recordings
 
     logging:
       driver: json-file
