@@ -66,6 +66,17 @@ jobs:
           tags: mediamtx-replay:test
           cache-from: type=gha,scope=replay
 
+      - name: Verify FFmpeg codecs
+        run: |
+          docker image inspect --format 'Image size (bytes): {{.Size}}' mediamtx-replay:test
+          docker run --rm --entrypoint sh mediamtx-replay:test -ec '
+            ffmpeg -v error -f lavfi -i color=c=black:s=64x64:r=5 \
+              -f lavfi -i anullsrc=r=44100:cl=mono -t 1 \
+              -c:v libx264 -threads 1 -pix_fmt yuv420p -c:a aac \
+              -movflags +faststart /tmp/replay-smoke.mp4
+            ffmpeg -v error -i /tmp/replay-smoke.mp4 -f null -
+          '
+
       - name: Verify service startup and healthcheck
         run: |
           docker run -d --name replay-health mediamtx-replay:test

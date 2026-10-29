@@ -1,13 +1,11 @@
-FROM node:22-bookworm-slim
+FROM node:22-alpine
 
 ENV NODE_ENV=production \
     PORT=9995 \
     CACHE_DIR=/app/proxy/media_cache \
     TEMP_DIR=/dev/shm
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg tini \
-    && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache ca-certificates ffmpeg tini
 
 WORKDIR /app/proxy
 

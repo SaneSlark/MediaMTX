@@ -1,6 +1,6 @@
 # MediaMTX Replay Proxy
 
-`replay` 分支提供独立的代理回放镜像，仅运行 `proxy/replay-proxy.js`，包含 Node.js、FFmpeg 和 tini。MediaMTX 的录制与 playback 服务需要单独部署；镜像不启动 MediaMTX 或延迟转发服务，也不需要挂载原始录像或 `mediamtx.yml`。
+`replay` 分支提供独立的代理回放镜像，使用轻量化的 `node:22-alpine` 基础镜像，仅运行 `proxy/replay-proxy.js`，包含 Node.js、FFmpeg 和 tini。MediaMTX 的录制与 playback 服务需要单独部署；镜像不启动 MediaMTX 或延迟转发服务，也不需要挂载原始录像或 `mediamtx.yml`。
 
 代理从外部 MediaMTX playback 的 `/get` 接口下载录像片段，经 FFmpeg 整理为 MP4 后缓存，支持 HTTP Range 拖动播放。原有 `main` 分支继续提供完整服务。
 
