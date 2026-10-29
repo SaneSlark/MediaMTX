@@ -300,7 +300,7 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
       if (entry.isDirectory()) {
         await cleanDirectory(fullPath);
       } else if (entry.isFile() && entry.name.endsWith('.mp4') && !entry.name.endsWith('.partial.mp4')) {
-        if (generating.has(fullPath)) continue;
+        if (generating.has(fullPath) || memoryFiles.has(fullPath)) continue;
         let stat;
         try {
           stat = await fs.stat(fullPath);
@@ -308,7 +308,7 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
           if (error.code === 'ENOENT') continue;
           throw error;
         }
-        if (stat.mtimeMs < expiresBefore && !generating.has(fullPath)) {
+        if (stat.mtimeMs < expiresBefore && !generating.has(fullPath) && !memoryFiles.has(fullPath)) {
           try {
             await fs.unlink(fullPath);
             cleaned += 1;
@@ -319,7 +319,8 @@ async function cleanCache(dir = CONFIG.CACHE_DIR) {
       }
     }
 
-    if (!isRoot && ![...generating].some((file) => file.startsWith(currentDir + path.sep))) {
+    const activeFiles = [...generating, ...memoryFiles.keys()];
+    if (!isRoot && !activeFiles.some((file) => file.startsWith(currentDir + path.sep))) {
       // rmdir only removes empty directories; concurrent generation may add a file.
       await fs.rmdir(currentDir).catch((error) => {
         if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error;
