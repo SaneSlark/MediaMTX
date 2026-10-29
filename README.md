@@ -2,7 +2,7 @@
 
 `replay` 分支提供独立的代理回放镜像，使用轻量化的 `node:22-alpine` 基础镜像，仅运行 `proxy/replay-proxy.js`，包含 Node.js、FFmpeg 和 tini。MediaMTX 的录制与 playback 服务需要单独部署；镜像不启动 MediaMTX 或延迟转发服务，也不需要挂载原始录像或 `mediamtx.yml`。
 
-代理从外部 MediaMTX playback 的 `/get` 接口读取分片 MP4，直接送入 FFmpeg，边下载边处理，减少首次回放等待。生成完成后缓存为支持 HTTP Range 拖动播放的普通 MP4。原有 `main` 分支继续提供完整服务。
+代理从外部 MediaMTX playback 的 `/get` 接口读取分片 MP4，直接送入 FFmpeg，边下载边在内存盘生成支持 HTTP Range 的普通 MP4。生成完成后立即从内存文件响应播放，同时后台保存磁盘缓存，减少首次回放等待。原有 `main` 分支继续提供完整服务。
 
 ## 从源码构建与启动
 
@@ -28,7 +28,7 @@ MEDIAMTX_BASE=http://192.168.1.100:9996
 
 ```bash
 docker build -t mediamtx-replay:local .
-docker run -d --name mediamtx-replay --restart unless-stopped \
+docker run -d --name mediamtx-replay --restart unless-stopped --shm-size=1g \
   -p 9995:9995 \
   -e MEDIAMTX_BASE=http://192.168.1.100:9996 \
   -v "$(pwd)/media_cache:/app/proxy/media_cache" \
@@ -71,7 +71,7 @@ GET /get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=60
 http://localhost:9995/get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=60
 ```
 
-返回 MP4，支持 HTTP Range；相同片段正在生成时返回 `202`，稍后重试。参数错误返回 `400`，生成失败返回 `500`。录像列表仍直接请求外部 MediaMTX 的 `/list?path=camera1`。
+返回 MP4，支持 HTTP Range；相同片段正在生成时返回 `202`，内存任务名额已满时返回 `503`，均可稍后重试。参数错误返回 `400`，生成失败返回 `500`。录像列表仍直接请求外部 MediaMTX 的 `/list?path=camera1`。
 
 ## 配置与缓存
 
@@ -80,6 +80,8 @@ http://localhost:9995/get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=6
 | `MEDIAMTX_BASE` | Compose 为 `http://host.docker.internal:9996` | 外部 MediaMTX playback 地址；直接运行脚本时默认 `http://localhost:9996` |
 | `PORT` | `9995` | 容器内 HTTP 端口；修改后需要同步端口映射 |
 | `CACHE_DIR` | `/app/proxy/media_cache` | MP4 缓存目录，Compose 挂载到本地 `./media_cache` |
+| `MEMORY_DIR` | `/dev/shm` | MP4 生成目录，需位于内存盘；Compose 共享内存上限 1 GB |
+| `MAX_MEMORY_JOBS` | `2` | 同时占用内存文件的任务上限，包括生成、后台保存和播放中的任务 |
 | `CACHE_KEEP_FOREVER` | `true` | 默认永久保留缓存；设为 `false` 后启用过期检查和定时清理 |
 | `CACHE_TTL_DAYS` | `90` | 缓存有效天数 |
 | `CLEAN_INT_DAYS` | `1` | 缓存清理间隔天数 |
@@ -89,7 +91,11 @@ http://localhost:9995/get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=6
 
 默认永久保留缓存，`CACHE_KEEP_FOREVER=false` 时才按有效期检查和定时清理，默认有效期 90 天、每天清理一次。可以用 `CACHE_TTL_MS` 和 `CLEAN_INTERVAL_MS` 覆盖对应的天数配置。缓存按摄像头和 UTC 日期分目录保存，有效期按文件修改时间计算；原始录像由外部 MediaMTX 独立管理。
 
-不再保存完整原始下载文件，也不需要配置 `TEMP_DIR` 或大容量 `/dev/shm`。生成中的半成品放在缓存目录，任务结束时会清理，进程异常退出的残留不由定时任务清理。不同片段可并发生成，请根据录像码率、时长和并发量预留 CPU、网络和缓存磁盘空间。
+原始下载数据直接进入 FFmpeg，不另存原始文件。FFmpeg 在 `MEMORY_DIR` 内完成 MP4 和 faststart 整理，生成后先从该文件响应，同时后台复制到磁盘的 `.partial.mp4`，复制成功后原子重命名为正式缓存。后台保存期间，相同片段的请求可继续从内存播放；保存和正在进行的播放都结束后释放内存文件。
+
+默认 `MAX_MEMORY_JOBS=2`，名额用完时新片段请求返回 `503` 和 `Retry-After: 1`；已生成的内存文件和磁盘缓存仍可访问。Compose 的 `shm_size: "1g"` 限定共享内存容量，可按码率、片段时长及并发量调整；文件超过可用容量时生成会失败并清理，不会发布不完整的缓存。`MEMORY_DIR` 改到普通磁盘目录就失去内存加速效果。
+
+后台保存失败会记录 `[CACHE]` 日志，当前播放继续，播放结束后释放内存；之后再次请求会重新生成。容器停止前尚未完成保存的内存片段不会持久保留，已有磁盘缓存按 `CACHE_KEEP_FOREVER` 等配置管理。异常退出留下的磁盘半成品不由定时任务清理。
 
 首次回放仍需等待该片段生成完成，随后才能返回可拖动的 MP4；片段越长，首播等待通常也越长。可以先请求较短片段。日志中的 `[PERF]` 会记录未缓存片段的总生成耗时，便于判断实际改善；已缓存片段仍直接读取文件。
 
@@ -105,6 +111,7 @@ services:
   replay:
     image: ghcr.io/saneslark/mediamtx-replay:latest
     restart: unless-stopped
+    shm_size: "1g"
     ports:
       - "9995:9995"
     environment:
@@ -132,6 +139,7 @@ services:
     image: ghcr.io/saneslark/mediamtx-replay:latest
     container_name: mediamtx-replay
     restart: unless-stopped
+    shm_size: "1g"
 
     ports:
       - "9995:9995" # 宿主机端口:容器端口
@@ -147,6 +155,8 @@ services:
       MEDIAMTX_BASE: ${MEDIAMTX_BASE:-http://host.docker.internal:9996}
 
       CACHE_DIR: /app/proxy/media_cache
+      MEMORY_DIR: /dev/shm
+      MAX_MEMORY_JOBS: "2"
       CACHE_KEEP_FOREVER: "true" # 默认永久保留；改为 false 后按有效期清理
       CACHE_TTL_DAYS: "90"       # 缓存保留天数
       CLEAN_INT_DAYS: "1"        # 每隔多少天清理一次

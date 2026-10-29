@@ -93,7 +93,23 @@ jobs:
           const http = require('node:http');
           const { spawnSync } = require('node:child_process');
           process.env.CACHE_DIR = '/tmp/replay-cache';
+          process.env.MEMORY_DIR = '/dev/shm/replay-ci';
+          process.env.MAX_MEMORY_JOBS = '1';
           process.env.DOWNLOAD_TIMEOUT_MS = '1000';
+          const extra = require('fs-extra');
+          const originalCopy = extra.copyFile;
+          let releaseCopy;
+          extra.copyFile = async (...args) => {
+            await new Promise(resolve => { releaseCopy = resolve; });
+            return originalCopy(...args);
+          };
+          const waitForFlush = async () => {
+            for (let i = 0; i < 100; i++) {
+              if ((await fs.readdir(process.env.MEMORY_DIR)).length === 0) return;
+              await new Promise(resolve => setTimeout(resolve, 20));
+            }
+            throw new Error('Memory file not released after persistence');
+          };
           let upstream, proxy, requests = 0;
           const listen = server => new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
           (async () => {
@@ -118,7 +134,11 @@ jobs:
             const base = `http://127.0.0.1:${proxy.address().port}`;
             const url = camera => `${base}/get?path=${camera}&start=2026-10-29T10%3A00%3A00Z&duration=2`;
             for (const camera of ['audio', 'silent']) {
-              const result = await fetch(url(camera));
+              let responseTimer;
+              const result = await Promise.race([
+                fetch(url(camera)),
+                new Promise((resolve, reject) => { responseTimer = setTimeout(() => reject(new Error('Response waited for disk copy')), 5000); }),
+              ]).finally(() => clearTimeout(responseTimer));
               assert.equal(result.status, 200);
               const video = Buffer.from(await result.arrayBuffer());
               await fs.writeFile('/tmp/output.mp4', video);
@@ -129,14 +149,43 @@ jobs:
               assert.equal(cached.status, 206);
               assert.deepEqual(Buffer.from(await cached.arrayBuffer()), video.subarray(0, 32));
               assert.equal(requests, before);
+              if (camera === 'audio') {
+                assert.equal(typeof releaseCopy, 'function');
+                assert((await fs.readdir(process.env.MEMORY_DIR)).length > 0);
+                const busy = await fetch(url('another'));
+                assert.equal(busy.status, 503);
+                assert.equal(busy.headers.get('retry-after'), '1');
+                assert.equal(requests, before);
+                extra.copyFile = originalCopy;
+                releaseCopy();
+              }
+              await waitForFlush();
+              // Subsequent requests must come from the completed disk cache.
+              const disk = await fetch(url(camera));
+              assert.equal(disk.status, 200);
+              assert.deepEqual(Buffer.from(await disk.arrayBuffer()), video);
+              assert.equal(requests, before);
             }
+            extra.copyFile = async () => { throw new Error('Simulated disk write failure'); };
+            const memoryOnly = await fetch(url('uncached'));
+            assert.equal(memoryOnly.status, 200);
+            await memoryOnly.arrayBuffer();
+            await waitForFlush();
+            extra.copyFile = originalCopy;
+            const beforeRetry = requests;
+            const retry = await fetch(url('uncached'));
+            assert.equal(retry.status, 200);
+            await retry.arrayBuffer();
+            assert.equal(requests, beforeRetry + 1);
+            await waitForFlush();
             for (const camera of ['stall', 'broken', 'invalid']) {
               assert.equal((await fetch(url(camera))).status, 500);
             }
             const files = await fs.readdir('/tmp/replay-cache', { recursive: true });
             assert(!files.some(file => file.endsWith('.partial.mp4')));
+            assert.deepEqual(await fs.readdir(process.env.MEMORY_DIR), []);
             assert.equal((await fetch(base + '/health')).status, 200);
-            console.log('PASS: streaming audio/silent MP4, decode, faststart, cached Range, timeout and error cleanup');
+            console.log('PASS: memory playback before disk completion, concurrent Range, slot limit, persistence failure recovery, disk cache, decode and error cleanup');
           })().catch(error => { console.error(error); process.exitCode = 1; }).finally(async () => {
             for (const server of [proxy, upstream]) {
               if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }

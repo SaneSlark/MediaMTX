@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     container_name: mediamtx-replay
     restart: unless-stopped
+    shm_size: "1g"
     ports:
       - "9995:9995"
     extra_hosts:
@@ -14,6 +15,8 @@ services:
     environment:
       TZ: Asia/Shanghai
       PORT: 9995
+      MEMORY_DIR: /dev/shm
+      MAX_MEMORY_JOBS: 2
       MEDIAMTX_BASE: ${MEDIAMTX_BASE:-http://host.docker.internal:9996}
       CACHE_KEEP_FOREVER: "false"
       CACHE_TTL_DAYS: 90

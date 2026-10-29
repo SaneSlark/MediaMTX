@@ -35,6 +35,8 @@ const CONFIG = {
   PORT: Number(process.env.PORT || 9995),
   MEDIAMTX_BASE: (process.env.MEDIAMTX_BASE || 'http://localhost:9996').replace(/\/$/, ''),
   CACHE_DIR: process.env.CACHE_DIR || path.join(__dirname, 'media_cache'),
+  MEMORY_DIR: process.env.MEMORY_DIR || '/dev/shm',
+  MAX_MEMORY_JOBS: Number(process.env.MAX_MEMORY_JOBS || 2),
   CACHE_KEEP_FOREVER: readBoolean('CACHE_KEEP_FOREVER', true),
   CACHE_TTL_MS: readDurationMs('CACHE_TTL_MS', 'CACHE_TTL_DAYS', 90),
   CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INT_DAYS', 1),
@@ -59,8 +61,12 @@ for (const key of ['CLEAN_INTERVAL_MS', 'FFMPEG_TIMEOUT_MS', 'DOWNLOAD_TIMEOUT_M
 if (!Number.isInteger(CONFIG.PORT) || CONFIG.PORT < 1 || CONFIG.PORT > 65535) {
   throw new Error('PORT must be an integer between 1 and 65535');
 }
+if (!Number.isInteger(CONFIG.MAX_MEMORY_JOBS) || CONFIG.MAX_MEMORY_JOBS < 1) {
+  throw new Error('MAX_MEMORY_JOBS must be a positive integer');
+}
 
 fs.ensureDirSync(CONFIG.CACHE_DIR);
+fs.ensureDirSync(CONFIG.MEMORY_DIR);
 
 /* ================== 工具函数 ================== */
 
@@ -348,6 +354,67 @@ async function downloadFile(sourceUrl, outputFile) {
 }
 
 const generating = new Set();
+const memoryFiles = new Map();
+const memoryJobs = new Set();
+
+async function releaseMemory(entry) {
+  if (!entry.finished || entry.readers !== 0 || entry.removing) return;
+  entry.removing = true;
+  try {
+    await fs.unlink(entry.filePath).catch((error) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    memoryJobs.delete(entry);
+  } catch (error) {
+    entry.removing = false;
+    console.error('[MEMORY] cleanup failed:', error.message);
+  }
+}
+
+function persistInBackground(entry) {
+  if (entry.persistence) return;
+  const stagingFile = `${entry.cacheFile}.${crypto.randomBytes(16).toString('hex')}.partial.mp4`;
+  entry.persistence = (async () => {
+    try {
+      await fs.ensureDir(path.dirname(entry.cacheFile));
+      await fs.copyFile(entry.filePath, stagingFile);
+      // Publish only a complete copy; Range readers never see a partial file.
+      await fs.rename(stagingFile, entry.cacheFile);
+      console.log(`[CACHE] persisted ${entry.cacheFile}`);
+    } catch (error) {
+      // Persistence failure must not interrupt a successful memory response.
+      console.error('[CACHE] background persistence failed:', error.message);
+    } finally {
+      await fs.unlink(stagingFile).catch(() => {});
+      if (memoryFiles.get(entry.cacheFile) === entry) memoryFiles.delete(entry.cacheFile);
+      entry.finished = true;
+      await releaseMemory(entry);
+    }
+  })();
+}
+
+async function serveMemory(entry, req, res) {
+  // Acquire synchronously before opening: background persistence cannot delete
+  // the file while this request is waiting for its descriptor.
+  entry.readers++;
+  let file;
+  try {
+    file = await fileSystem.open(entry.filePath, 'r');
+    const stat = await file.stat();
+    const response = serveRange(file, req, res, stat.size);
+    persistInBackground(entry);
+    return await response;
+  } finally {
+    try {
+      if (file) await file.close();
+    } finally {
+      // Also persist when the initiating client disconnects before playback.
+      persistInBackground(entry);
+      entry.readers--;
+      await releaseMemory(entry);
+    }
+  }
+}
 
 async function getCachedFile(cacheFile) {
   let stat;
@@ -365,20 +432,30 @@ async function getCachedFile(cacheFile) {
 }
 
 async function generateVideo(query, cacheFile) {
+  if (memoryJobs.size >= CONFIG.MAX_MEMORY_JOBS) {
+    const error = new Error('Memory generation slots are busy');
+    error.code = 'MEMORY_BUSY';
+    throw error;
+  }
   const id = crypto.randomBytes(16).toString('hex');
-  const stagingFile = `${cacheFile}.${id}.partial.mp4`;
+  const entry = {
+    cacheFile, filePath: path.join(CONFIG.MEMORY_DIR, `${id}.mp4`),
+    readers: 0, finished: false, removing: false, persistence: null,
+  };
+  memoryJobs.add(entry);
 
   try {
-    await fs.ensureDir(path.dirname(cacheFile));
     const params = new URLSearchParams({ ...query, format: 'fmp4' });
     const started = Date.now();
-    await downloadFile(`${CONFIG.MEDIAMTX_BASE}/get?${params}`, stagingFile);
-    if ((await fs.stat(stagingFile)).size === 0) throw new Error('FFmpeg produced an empty file');
-    await fs.rename(stagingFile, cacheFile);
-    console.log(`[PERF] ${query.path} generated in ${Date.now() - started}ms (streaming fmp4)`);
-    return await fs.stat(cacheFile);
-  } finally {
-    await fs.unlink(stagingFile).catch(() => {});
+    await downloadFile(`${CONFIG.MEDIAMTX_BASE}/get?${params}`, entry.filePath);
+    if ((await fs.stat(entry.filePath)).size === 0) throw new Error('FFmpeg produced an empty file');
+    memoryFiles.set(cacheFile, entry);
+    console.log(`[PERF] ${query.path} generated in memory in ${Date.now() - started}ms`);
+    return entry;
+  } catch (error) {
+    entry.finished = true;
+    await releaseMemory(entry);
+    throw error;
   }
 }
 
@@ -408,6 +485,8 @@ app.get('/get', async (req, res) => {
       return res.status(400).send(error.message);
     }
     cacheFile = getCacheFile(query);
+    const ready = memoryFiles.get(cacheFile);
+    if (ready) return await serveMemory(ready, req, res);
 
     // Acquire before the first asynchronous cache operation so expired-cache
     // requests cannot delete or replace a file another request just generated.
@@ -417,23 +496,29 @@ app.get('/get', async (req, res) => {
 
     generating.add(cacheFile);
     let file;
+    let memory;
     try {
-      if (!(await getCachedFile(cacheFile))) await generateVideo(query, cacheFile);
-      // Open once and use fstat on the same descriptor. Cleanup or replacement
-      // of the pathname cannot change the file being sent to this client.
-      try {
-        file = await fileSystem.open(cacheFile, 'r');
-      } catch (error) {
-        if (error.code !== 'ENOENT') throw error;
-        await generateVideo(query, cacheFile);
-        file = await fileSystem.open(cacheFile, 'r');
+      if (!(await getCachedFile(cacheFile))) {
+        memory = await generateVideo(query, cacheFile);
+      } else {
+        // Open once so a pathname replacement cannot affect this response.
+        try {
+          file = await fileSystem.open(cacheFile, 'r');
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          memory = await generateVideo(query, cacheFile);
+        }
       }
     } catch (error) {
       console.error(`${clientIP} video generation failed:`, error.message);
+      if (error.code === 'MEMORY_BUSY') {
+        return res.status(503).set('Retry-After', '1').send('Memory generation slots are busy; retry later');
+      }
       return res.status(500).send('Video generation failed');
     } finally {
       generating.delete(cacheFile);
     }
+    if (memory) return await serveMemory(memory, req, res);
     try {
       const stat = await file.stat();
       return await serveRange(file, req, res, stat.size);
@@ -474,6 +559,7 @@ if (require.main === module) {
     console.log(`Proxy: http://localhost:${CONFIG.PORT}`);
     console.log(`MediaMTX Playback: ${CONFIG.MEDIAMTX_BASE}`);
     console.log(`Cache Directory: ${CONFIG.CACHE_DIR}`);
+    console.log(`Memory Directory: ${CONFIG.MEMORY_DIR}`);
     console.log('===========================================');
   });
 }
