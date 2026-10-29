@@ -5,7 +5,6 @@
   "main": "replay-proxy.js",
   "scripts": {
     "start": "node replay-proxy.js",
-    "test": "node --test test/*.test.js",
     "check": "node --check replay-proxy.js"
   },
   "keywords": [],

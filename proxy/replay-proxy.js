@@ -36,7 +36,7 @@ const CONFIG = {
   MEDIAMTX_BASE: (process.env.MEDIAMTX_BASE || 'http://localhost:9996').replace(/\/$/, ''),
   CACHE_DIR: process.env.CACHE_DIR || path.join(__dirname, 'media_cache'),
   TEMP_DIR: process.env.TEMP_DIR || '/dev/shm',
-  CACHE_KEEP_FOREVER: readBoolean('CACHE_KEEP_FOREVER'),
+  CACHE_KEEP_FOREVER: readBoolean('CACHE_KEEP_FOREVER', true),
   CACHE_TTL_MS: readDurationMs('CACHE_TTL_MS', 'CACHE_TTL_DAYS', 90),
   CLEAN_INTERVAL_MS: readDurationMs('CLEAN_INTERVAL_MS', 'CLEAN_INT_DAYS', 1),
   FFMPEG_TIMEOUT_MS: Number(process.env.FFMPEG_TIMEOUT_MS || 60000),
@@ -455,10 +455,10 @@ if (require.main === module) {
 
   app.listen(CONFIG.PORT, () => {
     console.log('===========================================');
-    console.log('MediaMTX video proxy started');
+    console.log('MediaMTX Video Proxy Started');
     console.log(`Proxy: http://localhost:${CONFIG.PORT}`);
-    console.log(`MediaMTX playback: ${CONFIG.MEDIAMTX_BASE}`);
-    console.log(`Cache directory: ${CONFIG.CACHE_DIR}`);
+    console.log(`MediaMTX Playback: ${CONFIG.MEDIAMTX_BASE}`);
+    console.log(`Cache Directory: ${CONFIG.CACHE_DIR}`);
     console.log('===========================================');
   });
 }

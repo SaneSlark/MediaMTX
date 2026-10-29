@@ -4,7 +4,7 @@
 
 代理从外部 MediaMTX playback 的 `/get` 接口下载录像片段，经 FFmpeg 整理为 MP4 后缓存，支持 HTTP Range 拖动播放。原有 `main` 分支继续提供完整服务。
 
-## 构建与启动
+## 从源码构建与启动
 
 ```bash
 docker compose up -d --build
@@ -42,7 +42,10 @@ docker run -d --name mediamtx-replay --restart unless-stopped \
 ```text
 ghcr.io/saneslark/mediamtx-replay:latest
 ghcr.io/saneslark/mediamtx-replay:replay
+ghcr.io/saneslark/mediamtx-replay:v1.0.0
 ```
+
+推送 `replay-v1.0.0` 这类 Git 标签会发布对应的 `v1.0.0` 镜像版本；回放版本使用 `replay-v*` 标签，与完整服务的版本标签区分。
 
 仓库所有者或仓库名改变时，镜像地址自动使用 `<仓库全名>-replay`。Pull Request 到 `replay` 只做构建验证；手动触发可以指定额外版本标签。镜像发布成功后可直接运行：
 
@@ -78,30 +81,118 @@ http://localhost:9995/get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=6
 | `PORT` | `9995` | 容器内 HTTP 端口；修改后需要同步端口映射 |
 | `CACHE_DIR` | `/app/proxy/media_cache` | MP4 缓存目录，Compose 挂载到本地 `./media_cache` |
 | `TEMP_DIR` | `/dev/shm` | 下载临时目录，Compose 共享内存大小为 1 GB |
-| `CACHE_KEEP_FOREVER` | `false` | 为 `true` 时永久保留缓存 |
+| `CACHE_KEEP_FOREVER` | `true` | 默认永久保留缓存；设为 `false` 后启用过期检查和定时清理 |
 | `CACHE_TTL_DAYS` | `90` | 缓存有效天数 |
 | `CLEAN_INT_DAYS` | `1` | 缓存清理间隔天数 |
 | `DOWNLOAD_TIMEOUT_MS` | `120000` | 下载超时毫秒数 |
 | `FFMPEG_TIMEOUT_MS` | `60000` | FFmpeg 处理超时毫秒数 |
 | `MAX_DURATION` | `3600` | 最大片段秒数 |
 
-可以用 `CACHE_TTL_MS` 和 `CLEAN_INTERVAL_MS` 覆盖对应的天数配置。缓存按摄像头和 UTC 日期分目录保存，有效期按文件修改时间计算；原始录像由外部 MediaMTX 独立管理。
+默认永久保留缓存，`CACHE_KEEP_FOREVER=false` 时才按有效期检查和定时清理，默认有效期 90 天、每天清理一次。可以用 `CACHE_TTL_MS` 和 `CLEAN_INTERVAL_MS` 覆盖对应的天数配置。缓存按摄像头和 UTC 日期分目录保存，有效期按文件修改时间计算；原始录像由外部 MediaMTX 独立管理。
 
 临时文件与生成中的半成品会在任务结束时清理，进程异常退出的残留不由定时任务清理。不同片段可并发生成，请根据录像码率、时长和并发量调整共享内存大小。
 
 Docker 内置 `/health` 健康检查，仅检查代理进程是否可响应；上游连接和 FFmpeg 处理需要实际回放请求验证。
 
+
+## 最简 Docker Compose 配置
+
+新建 `docker-compose.yml`，填入以下内容，只需把 `MEDIAMTX_BASE` 改成你的 MediaMTX playback 地址：
+
+```yaml
+services:
+  replay:
+    image: ghcr.io/saneslark/mediamtx-replay:latest
+    restart: unless-stopped
+    ports:
+      - "9995:9995"
+    shm_size: "1g"
+    environment:
+      MEDIAMTX_BASE: http://192.168.1.100:9996
+    volumes:
+      - ./media_cache:/app/proxy/media_cache
+```
+
+在该文件所在目录执行：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+启动后访问 `http://服务器IP:9995/health` 检查服务。`9995` 是代理端口，`./media_cache` 保存回放缓存；源码默认开启永久保留，无需配置 `CACHE_KEEP_FOREVER`。`MEDIAMTX_BASE` 必须是容器可访问的地址，不能用 `localhost` 指代宿主机。
+
+## 完整 Docker Compose 配置
+
+需要调整缓存、超时和日志时，可使用以下配置：
+
+```yaml
+services:
+  replay:
+    image: ghcr.io/saneslark/mediamtx-replay:latest
+    container_name: mediamtx-replay
+    restart: unless-stopped
+
+    ports:
+      - "9995:9995" # 宿主机端口:容器端口
+
+    shm_size: "1g" # /dev/shm 临时下载空间，按片段大小和并发量调整
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # 允许容器访问宿主机
+
+    environment:
+      TZ: Asia/Shanghai
+      NODE_ENV: production
+      PORT: "9995"
+      # 默认连接宿主机，也可在 .env 中设置其他服务器地址
+      MEDIAMTX_BASE: ${MEDIAMTX_BASE:-http://host.docker.internal:9996}
+
+      CACHE_DIR: /app/proxy/media_cache
+      TEMP_DIR: /dev/shm
+      CACHE_KEEP_FOREVER: "true" # 默认永久保留；改为 false 后按有效期清理
+      CACHE_TTL_DAYS: "90"       # 缓存保留天数
+      CLEAN_INT_DAYS: "1"        # 每隔多少天清理一次
+      # 可选毫秒配置，启用后覆盖对应的天数配置
+      # CACHE_TTL_MS: "7776000000"
+      # CLEAN_INTERVAL_MS: "86400000"
+
+      DOWNLOAD_TIMEOUT_MS: "120000" # 下载超时：120 秒
+      FFMPEG_TIMEOUT_MS: "60000"    # FFmpeg 处理超时：60 秒
+      MAX_DURATION: "3600"         # 单次回放最大时长：3600 秒
+
+    volumes:
+      - ./media_cache:/app/proxy/media_cache # 缓存持久化到宿主机
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:' + process.env.PORT + '/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m" # 单个日志文件最大 50 MB
+        max-file: "3"   # 最多保留 3 个日志文件
+```
+
+保存为 `docker-compose.yml` 后，执行 `docker compose pull` 和 `docker compose up -d`。查看运行状态用 `docker compose ps`，查看日志用 `docker compose logs -f replay`，停止服务用 `docker compose down`；缓存保留在本地 `./media_cache` 目录。
+
+使用上面的默认地址时，宿主机上的 MediaMTX playback 需要监听容器可访问的地址，例如 `:9996`。如果只修改宿主机访问端口，将映射改成 `9994:9995` 即可；如果修改 `PORT` 或 `CACHE_DIR`，需要同步修改端口映射或缓存挂载的容器路径。健康检查只检测代理服务是否可响应。
+
 ## 源码与验证
 
-分支只保留回放代理源码、依赖锁文件、自动化测试和 Docker 部署配置。完整服务的 `delay/`、`docker-entrypoint.sh` 和 `mediamtx.example.yml` 已移除。
+分支只保留回放代理源码、依赖锁文件和 Docker 部署配置。完整服务的 `delay/`、`docker-entrypoint.sh` 和 `mediamtx.example.yml` 已移除。
 
 ```bash
 cd proxy
 npm ci
 npm run check
-npm test
 ```
 
-测试覆盖参数校验、CORS、Range/HEAD、缓存过期与永久保留、并发去重、上游错误、超时和下载中断清理。安装 FFmpeg 后，还会验证有声/无声 MP4 生成、实际解码、faststart、缓存复用、损坏媒体与 FFmpeg 超时；本地缺少 FFmpeg 时这三组测试会跳过。
-
-GitHub Actions 在实际构建出的镜像内强制执行全部测试，再检查默认启动命令和 Docker 健康检查，通过后才发布镜像。测试代码通过只读挂载提供，不进入发布镜像。测试使用临时目录和模拟 playback 上游，不连接生产摄像头。
+`npm run check` 检查代理脚本语法。GitHub Actions 构建镜像时执行语法检查，并在发布前验证容器默认启动命令和 Docker 健康检查；实际回放需连接 MediaMTX playback 验证。

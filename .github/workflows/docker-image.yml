@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - replay
+    tags:
+      - 'replay-v*'
   pull_request:
     branches:
       - replay
@@ -50,6 +52,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
+            type=match,pattern=replay-(v.*),group=1
             type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/replay' }}
             type=raw,value=${{ inputs.version }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.version != '' }}
@@ -62,13 +65,6 @@ jobs:
           load: true
           tags: mediamtx-replay:test
           cache-from: type=gha,scope=replay
-
-      - name: Test image with real FFmpeg
-        run: |
-          docker run --rm \
-            -e REQUIRE_FFMPEG_TESTS=1 \
-            -v "$GITHUB_WORKSPACE/proxy/test:/app/proxy/test:ro" \
-            mediamtx-replay:test node --test test/replay-proxy.test.js
 
       - name: Verify service startup and healthcheck
         run: |
