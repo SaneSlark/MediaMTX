@@ -4,6 +4,7 @@ FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NODE_ENV=production
+ENV TZ=Asia/Shanghai
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -25,6 +26,7 @@ RUN apt-get update \
         python3-gst-1.0 \
         python3-yaml \
         tini \
+        tzdata \
     && for element in \
         aacparse clocksync h264parse h265parse opusparse queue \
         rtph264depay rtph265depay rtpmp4adepay rtpmp4gdepay \
