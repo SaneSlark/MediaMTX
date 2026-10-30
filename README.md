@@ -78,6 +78,7 @@ http://localhost:9995/get?path=camera1&start=2026-10-29T10%3A00%3A00Z&duration=6
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MEDIAMTX_BASE` | Compose 为 `http://host.docker.internal:9996` | 外部 MediaMTX playback 地址；直接运行脚本时默认 `http://localhost:9996` |
+| `TZ` | `Asia/Shanghai` | 容器时区；镜像包含时区数据，可通过环境变量调整 |
 | `PORT` | `9995` | 容器内 HTTP 端口；修改后需要同步端口映射 |
 | `CACHE_DIR` | `/app/proxy/media_cache` | MP4 缓存目录，Compose 挂载到本地 `./media_cache` |
 | `MEMORY_DIR` | `/dev/shm` | MP4 生成目录，需位于内存盘；Compose 共享内存上限 1 GB |
